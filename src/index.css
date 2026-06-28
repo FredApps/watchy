@@ -424,6 +424,59 @@ h1 {
   gap: 6px;
 }
 
+.yt-list {
+  display: grid;
+  align-content: start;
+  gap: 8px;
+  max-height: 280px;
+  overflow: auto;
+}
+
+.yt-item {
+  display: grid;
+  grid-template-columns: 120px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+}
+
+.yt-thumb {
+  width: 120px;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  border-radius: 4px;
+  background: #0f1113;
+}
+
+.yt-meta {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.yt-title {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  color: #e5eaed;
+  font-size: 13px;
+  line-height: 1.25;
+}
+
+.yt-sub {
+  overflow: hidden;
+  color: #8d989f;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.yt-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 2px;
+}
+
 .media-folder {
   display: grid;
   width: 100%;
@@ -663,14 +716,14 @@ h1 {
 
 .message {
   position: relative;
-  font-size: 15px;
+  font-size: 18px;
   line-height: 1.35;
   overflow-wrap: anywhere;
 }
 
 .message.system {
   color: #b7c0c6;
-  font-size: 14px;
+  font-size: 17px;
 }
 
 .message-body a,
@@ -791,7 +844,7 @@ h1 {
   align-items: baseline;
   gap: 8px;
   color: #a5b0b7;
-  font-size: 13px;
+  font-size: 16px;
 }
 
 .message-meta strong {

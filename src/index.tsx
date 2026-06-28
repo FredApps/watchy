@@ -55,6 +55,14 @@ type SplashReaction = {
   timestamp: number;
 };
 
+type YouTubeResult = {
+  id: string;
+  title: string;
+  author: string;
+  duration: string;
+  thumbnail: string;
+};
+
 const basePath = "/watchy";
 const apiPath = `${basePath}/api`;
 const defaultChatWidth = 266;
@@ -244,6 +252,9 @@ function WatchRoom() {
   const [mediaResults, setMediaResults] = useState<MediaEntry[]>([]);
   const [expandedFolders, setExpandedFolders] = useState<Record<string, MediaEntry[] | undefined>>({});
   const [mediaLoading, setMediaLoading] = useState(false);
+  const [ytQuery, setYtQuery] = useState("");
+  const [ytResults, setYtResults] = useState<YouTubeResult[]>([]);
+  const [ytLoading, setYtLoading] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [videoAspectRatio, setVideoAspectRatio] = useState(16 / 9);
@@ -271,6 +282,7 @@ function WatchRoom() {
   const chatInputRef = useRef<HTMLInputElement | null>(null);
   const shouldPlayRef = useRef(false);
   const hlsRef = useRef<any>(null);
+  const shakaRef = useRef<any>(null);
   const clientId = useMemo(getOrCreateClientId, []);
   const leaderTime = useMemo(() => {
     const values = Object.values(tsMap).filter((value) => Number.isFinite(value));
@@ -411,10 +423,25 @@ function WatchRoom() {
         hlsRef.current.destroy();
         hlsRef.current = null;
       }
+      if (shakaRef.current) {
+        await shakaRef.current.destroy().catch(() => undefined);
+        shakaRef.current = null;
+      }
       target.pause();
       target.removeAttribute("src");
       target.load();
       if (!url) {
+        return;
+      }
+      // YouTube videos are served as a DASH manifest and played via shaka/MSE on
+      // the same <video> element, so all sync logic keeps working unchanged.
+      if (url.includes("/api/yt/manifest")) {
+        const shaka = (await import("shaka-player/dist/shaka-player.compiled.js")).default;
+        shaka.polyfill.installAll();
+        const player = new shaka.Player();
+        shakaRef.current = player;
+        await player.attach(target);
+        await player.load(url);
         return;
       }
       if (url.toLowerCase().includes(".m3u8") && !target.canPlayType("application/vnd.apple.mpegurl")) {
@@ -556,6 +583,35 @@ function WatchRoom() {
       window.clearTimeout(timeout);
     };
   }, [mediaQuery]);
+
+  useEffect(() => {
+    const query = ytQuery.trim();
+    if (!query) {
+      setYtResults([]);
+      setYtLoading(false);
+      return;
+    }
+    const controller = new AbortController();
+    const timeout = window.setTimeout(async () => {
+      setYtLoading(true);
+      try {
+        const response = await fetch(`${apiPath}/yt/search?q=${encodeURIComponent(query)}`, {
+          signal: controller.signal,
+        });
+        if (response.ok) {
+          setYtResults(await response.json());
+        }
+      } catch {
+        // aborted or failed; ignore
+      } finally {
+        setYtLoading(false);
+      }
+    }, 350);
+    return () => {
+      controller.abort();
+      window.clearTimeout(timeout);
+    };
+  }, [ytQuery]);
 
   async function toggleFolder(path: string) {
     if (expandedFolders[path]) {
@@ -1019,6 +1075,42 @@ function WatchRoom() {
               Queue
             </button>
           </form>
+          <div className="section-title">YouTube</div>
+          <input
+            value={ytQuery}
+            onChange={(event) => setYtQuery(event.target.value)}
+            placeholder="Search YouTube"
+          />
+          {(ytLoading || ytResults.length > 0) && (
+            <div className="yt-list">
+              {ytLoading && <div className="muted">Searching...</div>}
+              {ytResults.map((result) => {
+                const watchUrl = `https://www.youtube.com/watch?v=${result.id}`;
+                return (
+                  <div className="yt-item" key={result.id}>
+                    {result.thumbnail && <img className="yt-thumb" src={result.thumbnail} alt="" loading="lazy" />}
+                    <div className="yt-meta">
+                      <span className="yt-title" title={result.title}>
+                        {result.title}
+                      </span>
+                      <span className="yt-sub">
+                        {result.author}
+                        {result.duration ? ` · ${result.duration}` : ""}
+                      </span>
+                      <div className="yt-actions">
+                        <button type="button" onClick={() => playUrl(watchUrl)}>
+                          Watch
+                        </button>
+                        <button type="button" onClick={() => addToPlaylist(watchUrl)}>
+                          Queue
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
           <div className="section-title">Local media</div>
           <input
             value={mediaQuery}

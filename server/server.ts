@@ -1,10 +1,14 @@
 import compression from "compression";
+import { execFile } from "node:child_process";
 import crypto from "node:crypto";
 import express, { type NextFunction, type Request, type Response } from "express";
 import fs from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
+import { Readable } from "node:stream";
+import { promisify } from "node:util";
 import { Server, type Socket } from "socket.io";
+import { Innertube } from "youtubei.js";
 
 // Load .env from the project root so config (password, cookie secret) survives
 // restarts regardless of how the process is launched (e.g. Task Scheduler).
@@ -26,6 +30,8 @@ const COOKIE_SECRET =
 const MEDIA_ROOT = path.resolve(process.env.WATCHY_MEDIA_ROOT ?? path.join(process.cwd(), "media"));
 const MEDIA_BASE_URL = process.env.WATCHY_MEDIA_BASE_URL ?? `${BASE_PATH}/media`;
 const BUILD_DIR = path.resolve(import.meta.dirname, "../build");
+const YTDLP_PATH = process.env.YTDLP_PATH ?? "yt-dlp";
+const YT_MAX_HEIGHT = Number(process.env.YT_MAX_HEIGHT ?? 1080);
 const SUPPORTED_EXTENSIONS = new Set([".mp4", ".webm", ".m4v", ".mov", ".m3u8"]);
 const MESSAGE_REACTIONS = new Set([
   "\u{1F600}",
@@ -243,6 +249,65 @@ app.get(`${BASE_PATH}/api/media`, requireAuth, async (req, res, next) => {
   }
 });
 
+app.get(`${BASE_PATH}/api/yt/search`, requireAuth, async (req, res, next) => {
+  try {
+    const query = String(req.query.q ?? "").trim();
+    if (!query) {
+      res.json([]);
+      return;
+    }
+    const yt = await getInnertube();
+    const search = await yt.search(query, { type: "video" });
+    const results = search.results
+      .filter((r: any) => r.type === "Video" && r.id)
+      .slice(0, 15)
+      .map((r: any) => ({
+        id: r.id,
+        title: r.title?.text ?? "",
+        author: r.author?.name ?? "",
+        duration: r.duration?.text ?? "",
+        thumbnail: r.thumbnails?.[r.thumbnails.length - 1]?.url ?? r.thumbnails?.[0]?.url ?? "",
+      }));
+    res.json(results);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get(`${BASE_PATH}/api/yt/manifest`, requireAuth, async (req, res, next) => {
+  try {
+    const id = parseYouTubeId(`https://www.youtube.com/watch?v=${String(req.query.v ?? "")}`);
+    if (!id) {
+      res.status(400).json({ ok: false });
+      return;
+    }
+    const resolved = await resolveYouTube(id);
+    res.setHeader("Content-Type", "application/dash+xml");
+    res.setHeader("Cache-Control", "no-store");
+    res.send(buildDashManifest(id, resolved));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get(`${BASE_PATH}/api/yt/seg`, requireAuth, async (req, res) => {
+  const id = parseYouTubeId(`https://www.youtube.com/watch?v=${String(req.query.v ?? "")}`);
+  const itag = Number(req.query.itag);
+  if (!id || !Number.isInteger(itag)) {
+    res.status(400).end();
+    return;
+  }
+  try {
+    await proxyYouTubeSegment(id, itag, req, res, true);
+  } catch {
+    if (!res.headersSent) {
+      res.status(502).end();
+    } else {
+      res.end();
+    }
+  }
+});
+
 app.use(`${BASE_PATH}/media`, requireAuth, express.static(MEDIA_ROOT, { fallthrough: false }));
 app.use(BASE_PATH, express.static(BUILD_DIR, { fallthrough: true }));
 app.get(`${BASE_PATH}/*splat`, (_req, res) => {
@@ -310,8 +375,19 @@ io.on("connection", (socket: Socket) => {
     io.emit("REC:colorMap", state.colors);
   });
 
-  socket.on("CMD:host", (raw: unknown) => {
-    setHost(String(raw ?? ""), clientId);
+  socket.on("CMD:host", async (raw: unknown) => {
+    const url = String(raw ?? "");
+    const ytId = parseYouTubeId(url);
+    if (ytId) {
+      try {
+        const resolved = await resolveYouTube(ytId);
+        setHost(`${BASE_PATH}/api/yt/manifest?v=${ytId}`, clientId, resolved.title);
+      } catch (error) {
+        addSystemChat(clientId, `couldn't load YouTube video (${(error as Error).message})`);
+      }
+      return;
+    }
+    setHost(url, clientId);
   });
 
   socket.on("CMD:play", () => {
@@ -436,8 +512,21 @@ io.on("connection", (socket: Socket) => {
     io.emit("chatinit", state.chat);
   });
 
-  socket.on("CMD:playlistAdd", (raw: unknown) => {
-    const item = makePlaylistItem(String(raw ?? ""));
+  socket.on("CMD:playlistAdd", async (raw: unknown) => {
+    const url = String(raw ?? "");
+    let item: PlaylistItem | null;
+    const ytId = parseYouTubeId(url);
+    if (ytId) {
+      try {
+        const resolved = await resolveYouTube(ytId);
+        item = { url: `${BASE_PATH}/api/yt/manifest?v=${ytId}`, name: resolved.title, duration: resolved.durationSec, type: "file" };
+      } catch (error) {
+        addSystemChat(clientId, `couldn't load YouTube video (${(error as Error).message})`);
+        return;
+      }
+    } else {
+      item = makePlaylistItem(url);
+    }
     if (!item) {
       return;
     }
@@ -718,6 +807,256 @@ function getHostState(): HostState {
   };
 }
 
+// ---------------------------------------------------------------------------
+// YouTube support: yt-dlp resolves working stream URLs (handles SABR/PO-token),
+// youtubei.js supplies the DASH init/index ranges + codecs that yt-dlp omits,
+// and the client plays the resulting DASH manifest via shaka. All streams are
+// proxied (Range) so playback is independent of the viewer's IP/CORS.
+// ---------------------------------------------------------------------------
+
+const execFileAsync = promisify(execFile);
+
+type YtTrack = {
+  itag: number;
+  url: string;
+  mime: string;
+  codecs: string;
+  init: { start: number; end: number };
+  index: { start: number; end: number };
+  clen: number;
+  width?: number;
+  height?: number;
+  fps?: number;
+  bandwidth: number;
+  audioSampleRate?: number;
+};
+type YtResolved = {
+  title: string;
+  durationSec: number;
+  video: YtTrack;
+  audio: YtTrack;
+  resolvedAt: number;
+};
+
+const YT_CACHE_TTL_MS = 4 * 60 * 60 * 1000;
+const ytCache = new Map<string, YtResolved>();
+let innertube: Innertube | null = null;
+
+async function getInnertube(): Promise<Innertube> {
+  if (!innertube) {
+    innertube = await Innertube.create({ generate_session_locally: true });
+  }
+  return innertube;
+}
+
+function parseYouTubeId(input: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(input.trim());
+  } catch {
+    return null;
+  }
+  const host = url.hostname.replace(/^www\./, "").toLowerCase();
+  const idLike = (value: string | null) => (value && /^[\w-]{11}$/.test(value) ? value : null);
+  if (host === "youtu.be") {
+    return idLike(url.pathname.slice(1).split("/")[0]);
+  }
+  if (host === "youtube.com" || host === "m.youtube.com" || host === "music.youtube.com") {
+    if (url.pathname === "/watch") {
+      return idLike(url.searchParams.get("v"));
+    }
+    const parts = url.pathname.split("/").filter(Boolean);
+    if (parts[0] === "shorts" || parts[0] === "embed" || parts[0] === "v") {
+      return idLike(parts[1] ?? null);
+    }
+  }
+  return null;
+}
+
+type YtDlpFormat = {
+  format_id: string;
+  url?: string;
+  vcodec?: string;
+  acodec?: string;
+  height?: number;
+  width?: number;
+  fps?: number;
+  tbr?: number;
+  abr?: number;
+  ext?: string;
+};
+
+async function ytDlpFormats(id: string): Promise<Map<number, YtDlpFormat>> {
+  const { stdout } = await execFileAsync(
+    YTDLP_PATH,
+    ["-J", "--no-warnings", "--no-playlist", `https://www.youtube.com/watch?v=${id}`],
+    { maxBuffer: 64 * 1024 * 1024 },
+  );
+  const data = JSON.parse(stdout) as { formats?: YtDlpFormat[] };
+  const map = new Map<number, YtDlpFormat>();
+  for (const f of data.formats ?? []) {
+    const itag = Number(f.format_id);
+    if (Number.isInteger(itag) && f.url) {
+      map.set(itag, f);
+    }
+  }
+  return map;
+}
+
+function pickBest<T>(items: T[], score: (item: T) => number): T | undefined {
+  let best: T | undefined;
+  let bestScore = -Infinity;
+  for (const item of items) {
+    const s = score(item);
+    if (s > bestScore) {
+      bestScore = s;
+      best = item;
+    }
+  }
+  return best;
+}
+
+async function resolveYouTube(id: string): Promise<YtResolved> {
+  const cached = ytCache.get(id);
+  if (cached && Date.now() - cached.resolvedAt < YT_CACHE_TTL_MS) {
+    return cached;
+  }
+
+  const [formats, info] = await Promise.all([ytDlpFormats(id), getInnertube().then((yt) => yt.getInfo(id))]);
+  const adaptive = info.streaming_data?.adaptive_formats ?? [];
+
+  const byItag = (itag: number) => adaptive.find((f) => f.itag === itag);
+  const hasUrl = (itag: number) => formats.has(itag);
+
+  // Prefer H.264 (avc1) <= max height for broad MSE support; fall back to vp9.
+  const videoCandidates = adaptive.filter(
+    (f) => f.has_video && !f.has_audio && hasUrl(f.itag) && f.init_range && f.index_range && (f.height ?? 0) <= YT_MAX_HEIGHT,
+  );
+  const videoFmt =
+    pickBest(
+      videoCandidates.filter((f) => (f.mime_type ?? "").includes("avc1")),
+      (f) => (f.height ?? 0) * 1000 + (f.bitrate ?? 0) / 1000,
+    ) ?? pickBest(videoCandidates, (f) => (f.height ?? 0) * 1000 + (f.bitrate ?? 0) / 1000);
+
+  const audioCandidates = adaptive.filter(
+    (f) => f.has_audio && !f.has_video && hasUrl(f.itag) && f.init_range && f.index_range,
+  );
+  const audioFmt =
+    pickBest(
+      audioCandidates.filter((f) => (f.mime_type ?? "").includes("mp4a")),
+      (f) => f.bitrate ?? 0,
+    ) ?? pickBest(audioCandidates, (f) => f.bitrate ?? 0);
+
+  if (!videoFmt || !audioFmt) {
+    throw new Error("No playable YouTube formats found");
+  }
+
+  const toTrack = (f: NonNullable<ReturnType<typeof byItag>>): YtTrack => ({
+    itag: f.itag,
+    url: formats.get(f.itag)!.url!,
+    mime: (f.mime_type ?? "").split(";")[0],
+    codecs: /codecs="([^"]+)"/.exec(f.mime_type ?? "")?.[1] ?? "",
+    init: { start: f.init_range!.start, end: f.init_range!.end },
+    index: { start: f.index_range!.start, end: f.index_range!.end },
+    clen: Number(f.content_length ?? 0),
+    width: f.width,
+    height: f.height,
+    fps: f.fps,
+    bandwidth: f.bitrate ?? f.average_bitrate ?? 1_000_000,
+    audioSampleRate: f.audio_sample_rate ? Number(f.audio_sample_rate) : undefined,
+  });
+
+  const resolved: YtResolved = {
+    title: info.basic_info.title ?? "YouTube video",
+    durationSec: info.basic_info.duration ?? 0,
+    video: toTrack(videoFmt),
+    audio: toTrack(audioFmt),
+    resolvedAt: Date.now(),
+  };
+  ytCache.set(id, resolved);
+  return resolved;
+}
+
+async function proxyYouTubeSegment(
+  id: string,
+  itag: number,
+  req: Request,
+  res: Response,
+  allowReresolve: boolean,
+): Promise<void> {
+  const resolved = await resolveYouTube(id);
+  const track = resolved.video.itag === itag ? resolved.video : resolved.audio.itag === itag ? resolved.audio : null;
+  if (!track) {
+    res.status(404).end();
+    return;
+  }
+
+  const headers: Record<string, string> = {};
+  const range = req.headers.range;
+  if (range) {
+    headers.Range = range;
+  }
+  const upstream = await fetch(track.url, { headers });
+
+  if ((upstream.status === 403 || upstream.status === 410) && allowReresolve) {
+    ytCache.delete(id);
+    await proxyYouTubeSegment(id, itag, req, res, false);
+    return;
+  }
+  if (!upstream.ok && upstream.status !== 206) {
+    res.status(502).end();
+    return;
+  }
+
+  res.status(upstream.status);
+  for (const header of ["content-type", "content-length", "content-range", "accept-ranges"]) {
+    const value = upstream.headers.get(header);
+    if (value) {
+      res.setHeader(header, value);
+    }
+  }
+  if (!upstream.headers.get("accept-ranges")) {
+    res.setHeader("Accept-Ranges", "bytes");
+  }
+  if (!upstream.body) {
+    res.end();
+    return;
+  }
+  Readable.fromWeb(upstream.body as any).pipe(res);
+}
+
+function xmlEscape(value: string): string {
+  return value.replace(/[<>&"']/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", '"': "&quot;", "'": "&apos;" })[c]!);
+}
+
+function buildDashManifest(id: string, r: YtResolved): string {
+  const duration = `PT${r.durationSec}S`;
+  const seg = (itag: number) => `${BASE_PATH}/api/yt/seg?v=${id}&itag=${itag}`;
+  const v = r.video;
+  const a = r.audio;
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" profiles="urn:mpeg:dash:profile:isoff-on-demand:2011" type="static" mediaPresentationDuration="${duration}" minBufferTime="PT1.5S">
+  <Period>
+    <AdaptationSet mimeType="${v.mime}" contentType="video" segmentAlignment="true">
+      <Representation id="video" codecs="${xmlEscape(v.codecs)}" bandwidth="${v.bandwidth}" width="${v.width ?? 0}" height="${v.height ?? 0}"${v.fps ? ` frameRate="${v.fps}"` : ""}>
+        <BaseURL>${xmlEscape(seg(v.itag))}</BaseURL>
+        <SegmentBase indexRange="${v.index.start}-${v.index.end}">
+          <Initialization range="${v.init.start}-${v.init.end}"/>
+        </SegmentBase>
+      </Representation>
+    </AdaptationSet>
+    <AdaptationSet mimeType="${a.mime}" contentType="audio" segmentAlignment="true">
+      <Representation id="audio" codecs="${xmlEscape(a.codecs)}" bandwidth="${a.bandwidth}"${a.audioSampleRate ? ` audioSamplingRate="${a.audioSampleRate}"` : ""}>
+        <BaseURL>${xmlEscape(seg(a.itag))}</BaseURL>
+        <SegmentBase indexRange="${a.index.start}-${a.index.end}">
+          <Initialization range="${a.init.start}-${a.init.end}"/>
+        </SegmentBase>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>`;
+}
+
 function setHost(url: string, clientId?: string, label?: string) {
   const cleanUrl = url.trim().slice(0, 4000);
   if (cleanUrl && !isAllowedMediaUrl(cleanUrl)) {
@@ -764,6 +1103,11 @@ function makePlaylistItem(url: string): PlaylistItem | null {
 }
 
 function isAllowedMediaUrl(url: string) {
+  // Internal same-origin proxy/manifest paths (e.g. YouTube DASH manifest) are set
+  // by the server itself and are trusted.
+  if (url.startsWith(`${BASE_PATH}/api/yt/`)) {
+    return true;
+  }
   try {
     const parsed = new URL(url);
     return parsed.protocol === "https:" || parsed.protocol === "http:";
