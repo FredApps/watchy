@@ -10,6 +10,7 @@
 
 # production
 /build
+/media
 
 # misc
 .DS_Store
@@ -25,3 +26,6 @@ yarn-error.log*
 
 .theia
 .eslintcache
+.vscode/
+start-watchy.ps1
+*.local.ps1

@@ -1,84 +1,98 @@
-# WatchParty
+# Watchy
 
-![screenshot](https://github.com/howardchung/watchparty/raw/master/public/screenshot_full.png)
+Watchy is a small private synchronized watch room. It keeps one shared room in memory and focuses on direct video URL playback, chat, playlists, local media browsing, and video reactions.
 
-A website for watching videos together.
+This fork intentionally removes the original multi-room portal, accounts, subscriptions, virtual browser, screen sharing, file sharing, YouTube/WebTorrent integrations, Discord, Firebase, Redis, Postgres, and VM management code.
 
-## Description
+## Features
 
-- Synchronizes the video being watched with the current room
-- Plays, pauses, and seeks are synced to all watchers
-- Supports:
-  - Screen sharing (full screen, browser tab or application)
-  - Launch a shared virtual browser in the cloud (similar to rabb.it)
-  - Stream-your-own-file
-  - Video files on the Internet (anything accessible via HTTP)
-  - YouTube videos
-  - Magnet links (via WebTorrent)
-  - .m3u8 streams (HLS)
-- Create separate rooms for users on demand
-- Text chat
-- Video chat
+- One shared in-memory room
+- Password-gated access with a long-lived auth cookie
+- Direct HTTP/HTTPS media URL playback
+- Browser-native video plus HLS streams through `hls.js`
+- Synchronized play, pause, seek, playback rate, loop, and playlist state
+- Chat with markdown, emoji picker, replies, edits, message reactions, and colored names
+- Splash reactions over the video
+- Local media browser for a configured server-side directory
+- Optional theater/fullscreen layout and resizable chat column
 
-## Quick Start
+Room state is intentionally ephemeral and resets when the Node process restarts.
 
-- Clone this repo via `git clone git@github.com:howardchung/watchparty.git`
-- Install npm dependencies for the project via `npm install`
-- Start the server via `npm run dev`
-  - Defaults to port 8080, customize with `PORT` env var
-  - Set `SSL_KEY_FILE` and `SSL_CRT_FILE` for HTTPS.
-- Start the React application in a separate shell and port via `npm run ui`
-  - Point to server using `VITE_SERVER_HOST` env var if you customized it above
-  - Set `SSL_KEY_FILE` and `SSL_CRT_FILE` for HTTPS.
-  - HTTPS is required by the browser for some WebRTC features (camera, etc.)
-- Duplicate the `.env.example` file
-- Rename it to `.env`
-- Add config for the features you want as described in the advanced setup
+## Requirements
 
-## Advanced Setup (optional)
+- Node.js with TypeScript execution support for erasable TypeScript syntax
+- npm
+- A reverse proxy or direct Node binding for deployment
 
-All of these are optional and the application should work without them. Some functionality may be missing.
+## Install
 
-### YouTube API (video search)
+```sh
+npm install
+```
 
-This project uses the YouTube API for video search, which requires an API key. You can get one from Google [here](https://console.developers.google.com).
+## Build
 
-Without an API key you won't be able to search for videos via the searchbox.
+```sh
+npm run build
+```
 
-After creating a **YouTube Data API V3** access, you can create an API key which you can add to your environment variables by copying the `.env.example`, renaming it to `.env` and adding the key to the YOUTUBE_API_KEY variable.
+This runs the Vite production build, client typecheck, and server typecheck.
 
-After that restart your server to enable the YouTube API access on your server.
+## Run
 
-### Firebase Config (user authentication)
+```sh
+npm start
+```
 
-This project uses Firebase for authentication. This is used for user login, account management, subscriptions, and handling some features like room locking/permanence.
+By default the server listens on `127.0.0.1:3090` and serves the app at `/watchy`.
 
-To set up, create a new Firebase app (or reuse an old one) from [here](https://console.firebase.google.com/). After creating an application, click on the settings cog icon in the left menu next to "Project overview" and click on project settings. From there, scroll down, create a web application and copy the Firebase SDK configuration snippet JSON data.
+## Configuration
 
-Next, you have to stringify it: `JSON.stringify(PASTE_CONFIG_HERE)` in your browser console, then add it to `VITE_FIREBASE_CONFIG` in your .env file.
+Configuration is provided through environment variables:
 
-For server verification of accounts you'll also need `FIREBASE_ADMIN_SDK_CONFIG`, which you should do the same steps for.
+| Variable | Default | Description |
+| --- | --- | --- |
+| `PORT` | `3090` | Node server port |
+| `HOST` | `127.0.0.1` | Node bind host |
+| `BASE_PATH` | `/watchy` | App mount path |
+| `WATCHY_PASSWORD` | `change-me` | Password for the room |
+| `WATCHY_COOKIE_SECRET` | derived from password | HMAC secret for auth cookies |
+| `WATCHY_MEDIA_ROOT` | `./media` | Directory scanned by `/api/media` |
+| `WATCHY_MEDIA_BASE_URL` | `/watchy/media` | URL prefix for files under `WATCHY_MEDIA_ROOT` |
 
-### Virtual Browser Setup
+`WATCHY_MEDIA_ROOT` should point only at files you intend to expose. The API only returns supported video files and safe child paths. By default, media is served from the app under `/watchy/media`; set `WATCHY_MEDIA_BASE_URL` when files are exposed by another web server or CDN.
 
-This project supports creating virtual browsers (using https://github.com/m1k1o/neko) either on a cloud provider or with Docker containers. For development, Docker is easiest.
+Supported local media extensions:
 
-- Install Docker: `curl -fsSL https://get.docker.com | sh`
-- Make sure you have an SSH key pair set up on the server (`id_rsa` in `~/.ssh` directory), if not, use `ssh-keygen`.
-- Configure `DOCKER_VM_HOST_SSH_USER` if `root` is not the correct user
-- Note: If your web client is not running on the same physical machine as the server, you will also need to configure `DOCKER_VM_HOST` to a publically-resolvable value (i.e. not localhost)
-- If you want to run managed instance pools (whether on cloud or with Docker), configure `VM_MANAGER_CONFIG` and run the vmWorker service.
+- `.mp4`
+- `.webm`
+- `.m4v`
+- `.mov`
+- `.m3u8`
 
-### Room Persistence
+## Development
 
-- Configure Postgres by adding DATABASE_URL to your .env file and then setting up the database schema
-- This allows rooms to persist between server restarts
+```sh
+npm run dev
+```
 
-## Tech
+For frontend-only iteration you can also run:
 
-- React
-- TypeScript
-- Node.js
-- Redis
-- PostgreSQL
-- Docker
+```sh
+npm run ui
+```
+
+## Scripts
+
+- `npm start` - run the Node server
+- `npm run dev` - run the Node server in watch mode
+- `npm run ui` - run Vite
+- `npm run build` - build and typecheck everything
+- `npm run typecheck` - typecheck the client
+- `npm run typecheckServer` - typecheck the server
+
+## Notes
+
+- The app shell can be served publicly while API and Socket.IO access remain gated by the auth cookie.
+- Socket.IO uses the configured `BASE_PATH` for its websocket path.
+- The deployment proxy must support websockets.

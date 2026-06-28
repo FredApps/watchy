@@ -1,16 +1,15 @@
 {
   "compilerOptions": {
-    "target": "esnext",
+    "target": "es2022",
     "module": "esnext",
-    "moduleResolution": "node",
+    "moduleResolution": "bundler",
     "strict": true,
     "noEmit": true,
-    "allowJs": true,
     "allowSyntheticDefaultImports": true,
     "skipLibCheck": true,
-    "lib": ["dom", "dom.iterable", "esnext"],
+    "lib": ["dom", "dom.iterable", "es2022"],
     "jsx": "react-jsx",
-    "types": ["vite/client", "youtube"]
+    "types": ["vite/client"]
   },
-  "include": ["./**/*", "../global.d.ts"]
+  "include": ["./index.tsx", "../global.d.ts"]
 }

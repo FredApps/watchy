@@ -1,25 +1,8 @@
-import { loadEnvFile } from "node:process";
-import fs from "node:fs";
+import { defineConfig } from "vite";
 
-try {
-  loadEnvFile();
-} catch (e) {
-  console.log(e);
-}
-
-export default {
+export default defineConfig({
+  base: "/watchy/",
   build: {
     outDir: "build",
-    // sourcemap: true,
   },
-  server: {
-    https:
-      process.env.SSL_CRT_FILE && process.env.SSL_KEY_FILE
-        ? {
-            key: fs.readFileSync(process.env.SSL_KEY_FILE),
-            cert: fs.readFileSync(process.env.SSL_CRT_FILE),
-          }
-        : null,
-    allowedHosts: true,
-  },
-};
+});

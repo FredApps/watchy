@@ -1,793 +1,826 @@
-import config from "./config.ts";
-import fs from "node:fs";
-import express, { type Response } from "express";
-import bodyParser from "body-parser";
 import compression from "compression";
-import cors from "cors";
-import https from "node:https";
-import http from "node:http";
-import { Server } from "socket.io";
-import { searchYoutube, youtubePlaylist } from "./utils/youtube.ts";
-import { Room } from "./room.ts";
-import { redis, redisCount } from "./utils/redis.ts";
-import {
-  getCustomerByEmail,
-  createSelfServicePortal,
-  getIsSubscriberByEmail,
-} from "./utils/stripe.ts";
-import { deleteUser, validateUserToken } from "./utils/firebase.ts";
-import path from "node:path";
-import { getStartOfDay } from "./utils/time.ts";
-import { getSessionLimitSeconds } from "./vm/utils.ts";
-import { postgres, insertObject, upsertObject } from "./utils/postgres.ts";
-import axios, { isAxiosError } from "axios";
 import crypto from "node:crypto";
-import { gzipSync } from "node:zlib";
-import { resolveShard } from "./utils/resolveShard.ts";
-import { makeRoomName, makeUserName } from "./utils/moniker.ts";
-import { getStats } from "./utils/getStats.ts";
+import express, { type NextFunction, type Request, type Response } from "express";
+import fs from "node:fs/promises";
+import http from "node:http";
+import path from "node:path";
+import { Server, type Socket } from "socket.io";
 
-if (process.env.NODE_ENV === "development") {
-  axios.interceptors.request.use(
-    (config) => {
-      // console.log(config);
-      return config;
-    },
-    (error) => {
-      console.error(error);
-    },
-  );
-}
+const PORT = Number(process.env.PORT ?? 3090);
+const HOST = process.env.HOST ?? "127.0.0.1";
+const BASE_PATH = normalizeBase(process.env.BASE_PATH ?? "/watchy");
+const PASSWORD = process.env.WATCHY_PASSWORD ?? "change-me";
+const COOKIE_NAME = "watchy_auth";
+const COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 365 * 10;
+const COOKIE_SECRET =
+  process.env.WATCHY_COOKIE_SECRET ??
+  crypto.createHash("sha256").update(`watchy:${PASSWORD}`).digest("hex");
+const MEDIA_ROOT = path.resolve(process.env.WATCHY_MEDIA_ROOT ?? path.join(process.cwd(), "media"));
+const MEDIA_BASE_URL = process.env.WATCHY_MEDIA_BASE_URL ?? `${BASE_PATH}/media`;
+const BUILD_DIR = path.resolve(import.meta.dirname, "../build");
+const SUPPORTED_EXTENSIONS = new Set([".mp4", ".webm", ".m4v", ".mov", ".m3u8"]);
+const MESSAGE_REACTIONS = new Set([
+  "\u{1F600}",
+  "\u{1F603}",
+  "\u{1F604}",
+  "\u{1F601}",
+  "\u{1F606}",
+  "\u{1F605}",
+  "\u{1F602}",
+  "\u{1F923}",
+  "\u{1F642}",
+  "\u{1F60A}",
+  "\u{1F607}",
+  "\u{1F970}",
+  "\u{1F60D}",
+  "\u{1F929}",
+  "\u{1F618}",
+  "\u{1F617}",
+  "\u{1F619}",
+  "\u{1F61A}",
+  "\u{1F60B}",
+  "\u{1F61B}",
+  "\u{1F61C}",
+  "\u{1F92A}",
+  "\u{1F61D}",
+  "\u{1F911}",
+  "\u{1F917}",
+  "\u{1F92D}",
+  "\u{1F92B}",
+  "\u{1F914}",
+  "\u{1F910}",
+  "\u{1F928}",
+  "\u{1F633}",
+  "\u{1F97A}",
+  "\u{1F44D}",
+  "\u{1F44F}",
+  "\u{1F525}",
+  "\u{2728}",
+  "\u{1F37F}",
+  "\u{2764}\u{FE0F}",
+  "\u{1F389}",
+]);
+const SPLASH_REACTIONS = new Set([
+  "\u{1F916}",
+  "\u{1F496}",
+  "\u{1F97A}",
+  "\u{1F37F}",
+  "\u{1F608}",
+  "\u{1F33B}",
+  "\u{1F602}",
+  "\u{1FAE6}",
+  "\u{1F44F}",
+  "\u{1F422}",
+  "\u{1F975}",
+  "\u{1F64F}",
+  "\u{2728}",
+  "\u{1F62D}",
+  "\u{1F440}",
+  "\u{2764}\u{FE0F}",
+  "\u{1F47B}",
+  "\u{1F389}",
+  "\u{1F4AA}",
+  "\u{263A}\u{FE0F}",
+  "\u{1F964}",
+  "\u{1F479}",
+  "\u{1F913}",
+  "\u{1F48B}",
+  "\u{1F62E}",
+  "\u{1F525}",
+  "\u{1F979}",
+  "\u{1F434}",
+  "\u{1F33C}",
+  "\u{1F618}",
+  "\u{1F927}",
+  "\u{1F978}",
+]);
 
-const releaseInterval = 5 * 60 * 1000;
+type PlaylistItem = {
+  url: string;
+  name: string;
+  duration: number;
+  type: "file";
+};
+
+type MediaDirectory = {
+  type: "directory";
+  name: string;
+  path: string;
+};
+
+type MediaEntry = PlaylistItem | MediaDirectory;
+
+type SortableMediaEntry = MediaEntry & {
+  modifiedMs: number;
+};
+
+type SortablePlaylistItem = PlaylistItem & {
+  modifiedMs: number;
+};
+
+type ChatMessage = {
+  id: string;
+  name: string;
+  msg: string;
+  timestamp: string;
+  videoTS?: number;
+  editedAt?: string;
+  replyToId?: string;
+  replyToName?: string;
+  replyToMsg?: string;
+  replyToTimestamp?: string;
+  reactions?: Record<string, string[]>;
+};
+
+type User = {
+  id: string;
+  name: string;
+};
+
+type HostState = {
+  video: string;
+  videoTS: number;
+  paused: boolean;
+  playbackRate: number;
+  loop: boolean;
+};
+
+type WatchyState = HostState & {
+  playlist: PlaylistItem[];
+  chat: ChatMessage[];
+  names: Record<string, string>;
+  colors: Record<string, string>;
+  roster: User[];
+  tsMap: Record<string, number>;
+};
+
+const state: WatchyState = {
+  video: "",
+  videoTS: 0,
+  paused: true,
+  playbackRate: 1,
+  loop: false,
+  playlist: [],
+  chat: [],
+  names: {},
+  colors: {},
+  roster: [],
+  tsMap: {},
+};
+const socketByClientId = new Map<string, string>();
+
 const app = express();
-let server = null as https.Server | http.Server | null;
-if (config.SSL_KEY_FILE && config.SSL_CRT_FILE) {
-  const key = fs.readFileSync(config.SSL_KEY_FILE);
-  const cert = fs.readFileSync(config.SSL_CRT_FILE);
-  server = https.createServer({ key: key, cert: cert }, app);
-} else {
-  server = new http.Server(app);
-}
-server?.listen(config.PORT, config.HOST);
+const server = http.createServer(app);
+const io = new Server(server, {
+  path: `${BASE_PATH}/socket.io`,
+  transports: ["websocket", "polling"],
+});
 
-const io = new Server(server, { cors: {}, transports: ["websocket"] });
-io.engine.use(async (req: any, res: Response, next: () => void) => {
-  const roomId = req._query.roomId;
-  if (!roomId) {
-    return next();
+app.disable("x-powered-by");
+app.use(express.json({ limit: "64kb" }));
+app.use(compression());
+
+app.get("/", (_req, res) => res.redirect(BASE_PATH));
+app.post(`${BASE_PATH}/api/login`, (req, res) => {
+  if (String(req.body?.password ?? "") !== PASSWORD) {
+    res.status(401).json({ ok: false });
+    return;
   }
-  // Attempt to ensure the room being connected to is loaded in memory
-  // If it doesn't exist, we may fail later with "invalid namespace"
-  const shard = resolveShard(roomId);
-  const key = "/" + roomId;
-  // Check to make sure this shard should load this room
-  const isCorrectShard = !config.SHARD || shard === Number(config.SHARD);
-  // Get the room data from postgres
-  const persistedRoom = (
-    await postgres?.query<PersistentRoom>(
-      `SELECT * from room where "roomId" = $1`,
-      [key],
-    )
-  )?.rows?.[0];
-  // Don't await after this because we may have a race condition where 2 rquests both try to load the room
-  if (isCorrectShard && !rooms.has(key)) {
-    const data = persistedRoom?.data
-      ? JSON.stringify(persistedRoom.data)
-      : undefined;
-    if (data) {
-      const room = new Room(io, key, data);
-      rooms.set(key, room);
-      console.log(
-        "loading room %s into memory on shard %s",
-        roomId,
-        config.SHARD,
-      );
+
+  res.setHeader(
+    "Set-Cookie",
+    serializeCookie(COOKIE_NAME, createAuthToken(), {
+      httpOnly: true,
+      maxAge: COOKIE_MAX_AGE_SECONDS,
+      path: BASE_PATH,
+      sameSite: "Lax",
+      secure: true,
+    }),
+  );
+  res.json({ ok: true });
+});
+
+app.post(`${BASE_PATH}/api/logout`, (_req, res) => {
+  res.setHeader(
+    "Set-Cookie",
+    serializeCookie(COOKIE_NAME, "", {
+      httpOnly: true,
+      maxAge: 0,
+      path: BASE_PATH,
+      sameSite: "Lax",
+      secure: true,
+    }),
+  );
+  res.json({ ok: true });
+});
+
+app.get(`${BASE_PATH}/api/session`, requireAuth, (_req, res) => {
+  res.json({ ok: true });
+});
+
+app.get(`${BASE_PATH}/api/media`, requireAuth, async (req, res, next) => {
+  try {
+    const query = String(req.query.q ?? "").trim().toLowerCase();
+    const requestedPath = String(req.query.path ?? "");
+    if (query) {
+      const files = await searchMediaFiles(MEDIA_ROOT, query);
+      res.json(files.slice(0, 200));
+      return;
     }
+    const entries = await listMediaDirectory(MEDIA_ROOT, requestedPath);
+    res.json(entries);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.use(`${BASE_PATH}/media`, requireAuth, express.static(MEDIA_ROOT, { fallthrough: false }));
+app.use(BASE_PATH, express.static(BUILD_DIR, { fallthrough: true }));
+app.get(`${BASE_PATH}/*splat`, (_req, res) => {
+  res.sendFile(path.join(BUILD_DIR, "index.html"));
+});
+
+io.use((socket, next) => {
+  const cookies = parseCookies(socket.request.headers.cookie);
+  if (!verifyAuthToken(cookies[COOKIE_NAME])) {
+    next(new Error("unauthorized"));
+    return;
   }
   next();
 });
 
-const rooms = new Map<string, Room>();
-// Following functions iterate over in-memory rooms
-setInterval(minuteMetrics, 60 * 1000);
-setInterval(release, releaseInterval);
-setInterval(saveRooms, 1000);
-if (process.env.NODE_ENV === "development") {
-  try {
-    import("./vmWorker.ts");
-    // import('./syncSubs.ts');
-    // import('./timeSeries.ts');
-  } catch (e) {
-    console.error(e);
+io.on("connection", (socket: Socket) => {
+  const clientId = sanitizeClientId(socket.handshake.auth?.clientId);
+  const existingSocketId = socketByClientId.get(clientId);
+  if (existingSocketId && existingSocketId !== socket.id) {
+    io.sockets.sockets.get(existingSocketId)?.disconnect(true);
   }
-}
+  socketByClientId.set(clientId, socket.id);
+  socket.data.clientId = clientId;
+  state.names[clientId] ||= "Guest";
+  syncRoster();
 
-app.use(cors());
-app.use(bodyParser.json());
-app.use(bodyParser.raw({ type: "text/plain", limit: 1000000 }));
-
-app.get("/ping", (_req, res) => {
-  res.json("pong");
-});
-
-// Data's already compressed so go before the compression middleware
-app.get("/subtitle/:hash", async (req, res) => {
-  const key = "subtitle:" + req.params.hash;
-  const buf = await redis?.getBuffer(key);
-  if (!buf) {
-    res.status(404).end("not found");
-    return;
+  socket.emit("REC:host", getHostState());
+  socket.emit("REC:nameMap", state.names);
+  socket.emit("REC:colorMap", state.colors);
+  socket.emit("REC:tsMap", state.tsMap);
+  socket.emit("chatinit", state.chat);
+  socket.emit("playlist", state.playlist);
+  if (state.video && !state.paused) {
+    socket.emit("REC:play");
   }
-  await redis?.expire(key, 24 * 60 * 60);
-  res.setHeader("Content-Encoding", "gzip");
-  res.end(buf);
-});
+  emitRoster();
 
-app.use(compression());
+  socket.on("CMD:name", (raw: unknown) => {
+    const name = String(raw ?? "").trim().slice(0, 40) || "Guest";
+    state.names[clientId] = name;
+    syncRoster();
+    io.emit("REC:nameMap", state.names);
+    emitRoster();
+  });
 
-app.post("/subtitle", async (req, res) => {
-  const data = req.body;
-  if (!redis) {
-    return;
-  }
-  // calculate hash, gzip and save to redis
-  const hash = crypto
-    .createHash("sha256")
-    .update(data, "utf8")
-    .digest()
-    .toString("hex");
-  let gzipData = gzipSync(data);
-  await redis.setex("subtitle:" + hash, 24 * 60 * 60, gzipData);
-  redisCount("subUploads");
-  res.json({ hash });
-});
-
-app.get("/downloadSubtitles", async (req, res) => {
-  // Request the URL from OS
-  try {
-    const urlResp = await axios<{ link: string }>({
-      url: "https://api.opensubtitles.com/api/v1/download",
-      method: "POST",
-      headers: {
-        "User-Agent": "watchparty v1",
-        "Api-Key": config.OPENSUBTITLES_KEY,
-        Accept: "application/json",
-        "Content-Type": "application/json",
-        // 'Authorization': 'Bearer ' + config.OPENSUBTITLES_KEY,
-      },
-      data: {
-        file_id: req.query.file_id,
-        // sub_format: 'srt',
-      },
-    });
-    redisCount("subDownloadsOS");
-    if (!redis) {
-      // Return the direct link to the user, will work for about 3 hours
-      res.json(urlResp.data);
+  socket.on("CMD:color", (raw: unknown) => {
+    const color = String(raw ?? "").trim();
+    if (!/^#[0-9a-fA-F]{6}$/.test(color)) {
       return;
     }
-    // Cache the contents in Redis (longer retention)
-    const subResp = await axios.get(urlResp.data.link, {
-      responseType: "arraybuffer",
-    });
-    const data = subResp.data;
-    const hash = crypto
-      .createHash("sha256")
-      .update(data, "utf8")
-      .digest()
-      .toString("hex");
-    let gzipData = gzipSync(data);
-    await redis.setex("subtitle:" + hash, 24 * 60 * 60, gzipData);
-    res.json({ link: "/subtitle/" + hash });
-  } catch (e) {
-    if (isAxiosError(e)) {
-      console.log(e.response);
+    state.colors[clientId] = color;
+    io.emit("REC:colorMap", state.colors);
+  });
+
+  socket.on("CMD:host", (raw: unknown) => {
+    setHost(String(raw ?? ""), clientId);
+  });
+
+  socket.on("CMD:play", () => {
+    state.paused = false;
+    io.emit("REC:play");
+    addSystemChat(clientId, "started the video");
+    io.emit("REC:host", getHostState());
+  });
+
+  socket.on("CMD:pause", () => {
+    state.paused = true;
+    io.emit("REC:pause");
+    addSystemChat(clientId, "paused the video");
+    io.emit("REC:host", getHostState());
+  });
+
+  socket.on("CMD:seek", (raw: unknown) => {
+    const time = clampTime(Number(raw));
+    state.videoTS = time;
+    state.tsMap = {};
+    io.emit("REC:tsMap", state.tsMap);
+    io.emit("REC:seek", time);
+    addSystemChat(clientId, `jumped to ${formatTimestamp(time)}`);
+    io.emit("REC:host", getHostState());
+  });
+
+  socket.on("CMD:playbackRate", (raw: unknown) => {
+    const rate = clampPlaybackRate(Number(raw));
+    state.playbackRate = rate;
+    io.emit("REC:playbackRate", rate);
+    addSystemChat(clientId, `set playback to ${rate}x`);
+    io.emit("REC:host", getHostState());
+  });
+
+  socket.on("CMD:loop", (raw: unknown) => {
+    state.loop = Boolean(raw);
+    io.emit("REC:loop", state.loop);
+    io.emit("REC:host", getHostState());
+  });
+
+  socket.on("CMD:ts", (raw: unknown) => {
+    const time = clampTime(Number(raw));
+    state.tsMap[clientId] = time;
+    if (!state.paused) {
+      state.videoTS = Math.max(state.videoTS, time);
     }
-    throw e;
-  }
-});
+  });
 
-app.get("/searchSubtitles", async (req, res) => {
-  try {
-    const title = req.query.title ? String(req.query.title) : "";
-    const url = req.query.url ? String(req.query.url) : "";
-    let subUrl = "";
-    if (url) {
-      const startResp = await axios({
-        method: "get",
-        url: url,
-        headers: {
-          Range: "bytes=0-65535",
-        },
-        responseType: "arraybuffer",
-      });
-      const start = startResp.data;
-      const size = Number(startResp.headers["content-range"].split("/")[1]);
-      const endResp = await axios({
-        method: "get",
-        url: url,
-        headers: {
-          Range: `bytes=${size - 65536}-`,
-        },
-        responseType: "arraybuffer",
-      });
-      const end = endResp.data;
-      // console.log(start, end, size);
-      let hash = computeOpenSubtitlesHash(start, end, size);
-      // hash = 'f65334e75574f00f';
-      // Search API for subtitles by hash
-      subUrl = `https://api.opensubtitles.com/api/v1/subtitles?moviehash=${hash}&languages=en`;
-    } else if (title) {
-      subUrl = `https://api.opensubtitles.com/api/v1/subtitles?query=${title}&languages=en`;
+  socket.on("CMD:chat", (raw: unknown) => {
+    const data =
+      typeof raw === "object" && raw !== null
+        ? (raw as { msg?: unknown; replyToTimestamp?: unknown })
+        : { msg: raw };
+    const msg = String(data.msg ?? "").trim();
+    if (!msg || msg.length > 1000) {
+      return;
     }
-    // Alternative, web client calls this to get back some JS with the download URL embedded
-    // https://www.opensubtitles.com/nocache/download/7585196/subreq.js?file_name=Borgen.S04E01.en&locale=en&np=true&sub_frmt=srt&subtitle_id=6615808&ext_installed=false
-    // Up to 10 downloads per IP per day, but proxyable and doesn't require key
-    const response = await axios.get(subUrl, {
-      headers: {
-        "User-Agent": "watchparty v1",
-        "Api-Key": config.OPENSUBTITLES_KEY,
-      },
-    });
-    // console.log(subUrl, response.data);
-    const subtitles = response.data;
-    res.json(subtitles.data);
-  } catch (e: any) {
-    console.error(e.message);
-    res.json([]);
-  }
-  redisCount("subSearchesOS");
-});
-
-app.get("/stats", async (req, res) => {
-  if (req.query.key && req.query.key === config.STATS_KEY) {
-    const stats = await getStats();
-    res.json(stats);
-  } else {
-    res.status(403).json({ error: "Access Denied" });
-  }
-});
-
-app.get("/health/:metric", async (req, res) => {
-  const vmManagerStats = (
-    await axios.get("http://localhost:" + config.VMWORKER_PORT + "/stats")
-  ).data;
-  const result = vmManagerStats[req.params.metric]?.availableVBrowsers?.length;
-  res.status(result ? 200 : 500).json(result);
-});
-
-app.get("/timeSeries", async (req, res) => {
-  if (req.query.key && req.query.key === config.STATS_KEY && redis) {
-    const timeSeriesData = await redis.lrange("timeSeries", 0, -1);
-    const timeSeries = timeSeriesData.map((entry) => JSON.parse(entry));
-    res.json(timeSeries);
-  } else {
-    res.status(403).json({ error: "Access Denied" });
-  }
-});
-
-app.get("/youtube", async (req, res) => {
-  if (typeof req.query.q === "string") {
-    try {
-      redisCount("youtubeSearch");
-      const items = await searchYoutube(req.query.q);
-      res.json(items);
-    } catch {
-      res.status(500).json({ error: "youtube error" });
-    }
-  } else {
-    res.status(500).json({ error: "query must be a string" });
-  }
-});
-
-app.get("/youtubePlaylist/:playlistId", async (req, res) => {
-  try {
-    const items = await youtubePlaylist(req.params.playlistId);
-    res.json(items);
-  } catch {
-    res.status(500).json({ error: "youtube error" });
-  }
-});
-
-app.post("/createRoom", async (req, res) => {
-  const genName = () => "/" + makeRoomName(config.SHARD);
-  let name = genName();
-  console.log("createRoom: ", name);
-  const newRoom = new Room(io, name);
-  if (postgres) {
-    const now = new Date();
-    const roomObj = {
-      roomId: newRoom.roomId,
-      lastUpdateTime: now,
-      creationTime: now,
+    const replyToTimestamp = String(data.replyToTimestamp ?? "");
+    const replyTarget = replyToTimestamp
+      ? state.chat.find((message) => message.timestamp === replyToTimestamp)
+      : undefined;
+    const chatMessage: ChatMessage = {
+      id: clientId,
+      name: state.names[clientId] || "Guest",
+      msg,
+      timestamp: new Date().toISOString(),
+      videoTS: state.tsMap[clientId],
     };
-    try {
-      await insertObject(postgres, "room", roomObj);
-    } catch (e) {
-      redisCount("createRoomError");
-      throw e;
+    if (replyTarget) {
+      chatMessage.replyToId = replyTarget.id;
+      chatMessage.replyToName = replyTarget.id
+        ? state.names[replyTarget.id] || replyTarget.name
+        : replyTarget.name;
+      chatMessage.replyToMsg = replyTarget.msg;
+      chatMessage.replyToTimestamp = replyTarget.timestamp;
     }
-  }
-  const decoded = await validateUserToken(req.body?.uid, req.body?.token);
-  newRoom.creator = decoded?.email;
-  const preload = (req.body?.video || "").slice(0, 20000);
-  if (preload) {
-    redisCount("createRoomPreload");
-    newRoom.video = preload;
-    newRoom.paused = true;
-    await newRoom.saveRoom();
-  }
-  const prePlaylist = Array.isArray(req.body?.playlist) && req.body?.playlist;
-  if (prePlaylist) {
-    for (let item of req.body.playlist) {
-      newRoom.playlistAdd(null, item);
+    addChat(chatMessage);
+  });
+
+  socket.on("CMD:editChat", (raw: unknown) => {
+    const data = raw as { timestamp?: string; msg?: string };
+    const timestamp = String(data?.timestamp ?? "");
+    const msg = String(data?.msg ?? "").trim();
+    if (!timestamp || !msg || msg.length > 1000) {
+      return;
     }
-  }
-  rooms.set(name, newRoom);
-  res.json({ name });
-});
-
-app.post("/manageSub", async (req, res) => {
-  const decoded = await validateUserToken(
-    String(req.body?.uid),
-    String(req.body?.token),
-  );
-  if (!decoded) {
-    res.status(400).json({ error: "invalid user token" });
-    return;
-  }
-  if (!decoded.email) {
-    res.status(400).json({ error: "no email found" });
-    return;
-  }
-  const customer = await getCustomerByEmail(decoded.email);
-  if (!customer) {
-    res.status(400).json({ error: "customer not found" });
-    return;
-  }
-  const session = await createSelfServicePortal(
-    customer.id,
-    req.body?.return_url,
-  );
-  res.json(session);
-});
-
-app.delete("/deleteAccount", async (req, res) => {
-  // TODO pass this in req.query instead
-  const decoded = await validateUserToken(req.body?.uid, req.body?.token);
-  if (!decoded) {
-    res.status(400).json({ error: "invalid user token" });
-    return;
-  }
-  if (postgres) {
-    // Delete rooms
-    await postgres.query("DELETE FROM room WHERE owner = $1", [decoded.uid]);
-    // Delete linked accounts
-    await postgres.query("DELETE FROM link_account WHERE uid = $1", [
-      decoded.uid,
-    ]);
-  }
-  await deleteUser(decoded.uid);
-  redisCount("deleteAccount");
-  res.json({});
-});
-
-app.get("/metadata", async (req, res) => {
-  const decoded = await validateUserToken(
-    String(req.query?.uid),
-    String(req.query?.token),
-  );
-  let isSubscriber = await getIsSubscriberByEmail(decoded?.email);
-  // Has the user ever been a subscriber?
-  // const customer = await getCustomerByEmail(decoded.email);
-  let isFreePoolFull = false;
-  try {
-    isFreePoolFull = (
-      await axios.get(
-        "http://localhost:" + config.VMWORKER_PORT + "/isFreePoolFull",
-      )
-    ).data.isFull;
-  } catch (e: any) {
-    console.warn("[WARNING]: free pool check failed: %s", e.code);
-  }
-  const beta =
-    decoded?.email != null &&
-    Boolean(config.BETA_USER_EMAILS.split(",").includes(decoded?.email));
-  const streamPath = beta ? config.STREAM_PATH : undefined;
-  const convertPath = isSubscriber ? config.CONVERT_PATH : undefined;
-  // log metrics but don't wait for it
-  if (postgres && decoded?.uid) {
-    upsertObject(
-      postgres,
-      "active_user",
-      { uid: decoded?.uid, lastActiveTime: new Date() },
-      { uid: true },
+    const target = state.chat.find(
+      (message) => message.id === clientId && message.timestamp === timestamp,
     );
-  }
-  res.json({
-    isSubscriber,
-    isFreePoolFull,
-    beta,
-    streamPath,
-    convertPath,
+    if (!target) {
+      return;
+    }
+    target.msg = msg;
+    target.editedAt = new Date().toISOString();
+    io.emit("chatinit", state.chat);
+  });
+
+  socket.on("CMD:messageReaction", (raw: unknown) => {
+    const data = raw as { timestamp?: string; value?: string };
+    const timestamp = String(data?.timestamp ?? "");
+    const value = String(data?.value ?? "");
+    if (!timestamp || !MESSAGE_REACTIONS.has(value)) {
+      return;
+    }
+    const target = state.chat.find((message) => message.id && message.timestamp === timestamp);
+    if (!target) {
+      return;
+    }
+    target.reactions ||= {};
+    target.reactions[value] ||= [];
+    if (target.reactions[value].includes(clientId)) {
+      target.reactions[value] = target.reactions[value].filter((id) => id !== clientId);
+    } else {
+      target.reactions[value].push(clientId);
+    }
+    if (target.reactions[value].length === 0) {
+      delete target.reactions[value];
+    }
+    if (Object.keys(target.reactions).length === 0) {
+      delete target.reactions;
+    }
+    io.emit("chatinit", state.chat);
+  });
+
+  socket.on("CMD:playlistAdd", (raw: unknown) => {
+    const item = makePlaylistItem(String(raw ?? ""));
+    if (!item) {
+      return;
+    }
+    state.playlist.push(item);
+    io.emit("playlist", state.playlist);
+    addSystemChat(clientId, `added to playlist: ${item.name}`);
+    if (!state.video) {
+      playlistNext(clientId);
+    }
+  });
+
+  socket.on("CMD:playlistNext", () => playlistNext(clientId));
+
+  socket.on("CMD:playlistMove", (raw: unknown) => {
+    const data = raw as { index?: number; toIndex?: number };
+    const index = Number(data?.index);
+    const toIndex = Number(data?.toIndex);
+    if (!Number.isInteger(index) || !Number.isInteger(toIndex)) {
+      return;
+    }
+    if (index < 0 || index >= state.playlist.length) {
+      return;
+    }
+    const [item] = state.playlist.splice(index, 1);
+    state.playlist.splice(Math.max(0, Math.min(toIndex, state.playlist.length)), 0, item);
+    io.emit("playlist", state.playlist);
+  });
+
+  socket.on("CMD:playlistDelete", (raw: unknown) => {
+    const index = Number(raw);
+    if (!Number.isInteger(index) || index < 0 || index >= state.playlist.length) {
+      return;
+    }
+    state.playlist.splice(index, 1);
+    io.emit("playlist", state.playlist);
+  });
+
+  socket.on("CMD:splashReaction", (raw: unknown) => {
+    const value = String(raw ?? "");
+    if (!SPLASH_REACTIONS.has(value)) {
+      return;
+    }
+    io.emit("REC:splashReaction", {
+      id: crypto.randomUUID(),
+      value,
+      user: clientId,
+      timestamp: Date.now(),
+    });
+  });
+
+  socket.on("disconnect", () => {
+    if (socketByClientId.get(clientId) === socket.id) {
+      socketByClientId.delete(clientId);
+      delete state.tsMap[clientId];
+      syncRoster();
+      emitRoster();
+      io.emit("REC:tsMap", state.tsMap);
+    }
   });
 });
 
-app.get("/resolveRoom/:vanity", async (req, res) => {
-  const vanity = req.params.vanity;
-  const result = await postgres?.query(
-    `SELECT "roomId", vanity from room WHERE LOWER(vanity) = $1`,
-    [vanity?.toLowerCase() ?? ""],
-  );
-  // console.log(vanity, result.rows);
-  // We also use this for checking name availability, so just return null if it doesn't exist (http 200)
-  res.json(result?.rows[0] ?? null);
+setInterval(() => {
+  if (Object.keys(state.tsMap).length > 0) {
+    io.emit("REC:tsMap", state.tsMap);
+  }
+}, 1000);
+
+setInterval(() => {
+  const before = state.roster.map((user) => user.id).join(",");
+  syncRoster();
+  const after = state.roster.map((user) => user.id).join(",");
+  if (before !== after) {
+    emitRoster();
+  }
+}, 5000);
+
+server.listen(PORT, HOST, () => {
+  console.log(`watchy listening on http://${HOST}:${PORT}${BASE_PATH}`);
+  console.log(`media root: ${MEDIA_ROOT}`);
 });
 
-app.get("/roomData/:roomId", async (req, res) => {
-  // Returns the room data given a room ID
-  // Only return data if the room doesn't have a password
-  // If it does, we could accept it as a URL parameter but for now just don't support
-  const result = await postgres?.query(
-    `SELECT data from room WHERE "roomId" = $1 and password IS NULL`,
-    ["/" + req.params.roomId],
-  );
-  res.json(result?.rows[0]?.data);
-});
-
-app.get("/resolveShard/:roomId", async (req, res) => {
-  const shardNum = resolveShard(req.params.roomId);
-  res.send(String(config.SHARD ? shardNum : ""));
-});
-
-app.get("/listRooms", async (req, res) => {
-  const decoded = await validateUserToken(
-    String(req.query?.uid),
-    String(req.query?.token),
-  );
-  if (!decoded) {
-    res.status(400).json({ error: "invalid user token" });
+function requireAuth(req: Request, res: Response, next: NextFunction) {
+  if (!verifyAuthToken(parseCookies(req.headers.cookie)[COOKIE_NAME])) {
+    res.status(401).json({ ok: false });
     return;
   }
-  const result = await postgres?.query<PersistentRoom>(
-    `SELECT "roomId", vanity, password from room WHERE owner = $1`,
-    [decoded.uid],
-  );
-  res.json(result?.rows ?? []);
-});
+  next();
+}
 
-app.delete("/deleteRoom", async (req, res) => {
-  const decoded = await validateUserToken(
-    String(req.query?.uid),
-    String(req.query?.token),
-  );
-  if (!decoded) {
-    res.status(400).json({ error: "invalid user token" });
-    return;
-  }
-  const result = await postgres?.query(
-    `DELETE from room WHERE owner = $1 and "roomId" = $2`,
-    [decoded.uid, req.query.roomId],
-  );
-  res.json(result?.rows);
-});
+function createAuthToken() {
+  const payload = Buffer.from(
+    JSON.stringify({ exp: Date.now() + COOKIE_MAX_AGE_SECONDS * 1000 }),
+  ).toString("base64url");
+  const signature = crypto
+    .createHmac("sha256", COOKIE_SECRET)
+    .update(payload)
+    .digest("base64url");
+  return `${payload}.${signature}`;
+}
 
-app.get("/linkAccount", async (req, res) => {
-  const decoded = await validateUserToken(
-    String(req.query?.uid),
-    String(req.query?.token),
-  );
-  if (!decoded) {
-    res.status(400).json({ error: "invalid user token" });
-    return;
+function verifyAuthToken(token: string | undefined) {
+  if (!token) {
+    return false;
   }
-  if (!postgres) {
-    res.status(400).json({ error: "invalid database client" });
-    return;
+  const [payload, signature] = token.split(".");
+  if (!payload || !signature) {
+    return false;
   }
-  // Get the linked accounts for the user
-  let linkAccounts: LinkAccount[] = [];
-  if (decoded?.uid && postgres) {
-    const { rows } = await postgres.query(
-      "SELECT kind, accountid, accountname, discriminator FROM link_account WHERE uid = $1",
-      [decoded?.uid],
-    );
-    linkAccounts = rows;
+  const expected = crypto
+    .createHmac("sha256", COOKIE_SECRET)
+    .update(payload)
+    .digest("base64url");
+  if (signature.length !== expected.length) {
+    return false;
   }
-  res.json(linkAccounts);
-});
-
-app.post("/linkAccount", async (req, res) => {
-  const decoded = await validateUserToken(
-    String(req.body?.uid),
-    String(req.body?.token),
-  );
-  if (!decoded) {
-    res.status(400).json({ error: "invalid user token" });
-    return;
+  if (!crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) {
+    return false;
   }
-  if (!postgres) {
-    res.status(400).json({ error: "invalid database client" });
-    return;
-  }
-  const kind = req.body?.kind;
-  if (kind === "discord") {
-    const tokenType = req.body?.tokenType;
-    const accessToken = req.body.accessToken;
-    // Get the token and verify the user
-    const response = await axios.get("https://discord.com/api/users/@me", {
-      headers: {
-        authorization: `${tokenType} ${accessToken}`,
-      },
-    });
-    const accountid = response.data.id;
-    const accountname = response.data.username;
-    const discriminator = response.data.discriminator;
-    // Store the user id, username, discriminator
-    await upsertObject(
-      postgres,
-      "link_account",
-      {
-        accountid: accountid,
-        accountname: accountname,
-        discriminator: discriminator,
-        uid: decoded.uid,
-        kind: kind,
-      },
-      { uid: true, kind: true },
-    );
-    res.json({});
-  } else {
-    res.status(400).json({ error: "unsupported kind" });
-  }
-});
-
-app.delete("/linkAccount", async (req, res) => {
-  // TODO read from req.query instead
-  const decoded = await validateUserToken(
-    String(req.body?.uid),
-    String(req.body?.token),
-  );
-  if (!decoded) {
-    res.status(400).json({ error: "invalid user token" });
-    return;
-  }
-  if (!postgres) {
-    res.status(400).json({ error: "invalid database client" });
-    return;
-  }
-  await postgres.query(
-    "DELETE FROM link_account WHERE uid = $1 AND kind = $2",
-    [decoded.uid, req.body.kind],
-  );
-  res.json({});
-});
-
-app.get("/generateName", async (req, res) => {
-  res.send(makeUserName());
-});
-
-// Proxy video segments
-app.get("/proxy/*splat", async (req, res) => {
-  redisCount("proxyReqs");
   try {
-    const parsed = new URL("http://localhost" + req.url);
-    const pathname = parsed.pathname.slice("/proxy".length);
-    const host = parsed.searchParams.get("host");
-    if (pathname.endsWith("index-dvr.m3u8")) {
-      // VOD
-      // https://d2vjef5jvl6bfs.cloudfront.net/3012391a6c3e84c79ef6_gamesdonequick_41198403369_1681059003/chunked/index-dvr.m3u8
-      const resp = await axios.get("https://" + host + pathname);
-      const re2 = /(.*.ts)/g;
-      let repl = resp.data.replaceAll(re2, `$1?host=${host}`);
-      // Mark this as a VOD
-      repl += "#EXT-X-ENDLIST";
-      res.send(repl);
-    } else if (pathname.endsWith(".m3u8")) {
-      // Stream
-      // https://video-weaver.sea02.hls.ttvnw.net/v1/playlist/CrQEgv7Mz6nnsfJH3XtVQxeYXk8mViy1zNGWglcybvxZsI1rv3iLnjAnnqwCiVXCJ-DdD27J6RuFrLy7YUYwHUCKazIKICIupUCn9UXtaBYhBM5JIYqg9dz6NWYrCWU9HZJj2TGROv9mAOKuTR51YS82hdYL4PFZa3xxWXhgDsxXQHNDB03kY6S0aG0-EVva1xYrn5Ge6IAXRwug9QDGlb-ydtF3BtYppoTklVI7CVLySPPwbbt5Ow1JXdnKhLSwQEs4bh3BLwMnRBwUFI5nmE18BLYbkMOUivgYP5SSMgnGGlSkJO-iJNPWvepunEgyBUzB_7L-b1keTcV-Qak9IcWIITIWbRvmg6qB3ZSuWdcJgWKmdXdIn4qoRM4o16G1_0N_WRqPtMQFo0hmTlAVmHrzRArJQmaSgqAxZxRbFMd9RFeX6qjP9NtwguPbSeStdVbQxMNC34iavYUIxo8Ug812BHsG7J_kIlof2zkIqkEbP3oV3UkSByIo7xh9EEVargjaGDuQRt8zPQ6-fNBWJJe9F6IFu7lXBPIJ016lopyfcvTWjbLbBHsVkg6vG-3UISh0nud7KB5g5ipQePhtcFSI5hvjlfX1DAVHEpTWXkvlnL4wNqEqpBYL2btSXYeE1Cb-RAvrAT0s61usERcL2eI-S5aTcSO8_hxQ2afC7c9vlypOWgP6p6XNpViZHXmdXv4t-d68Z-MpLtSU7VbB3pRWnSswFFyA3W39ITic4lb97Djp3wHhGgz0Sy8aDb9r0tnphIYgASoJdXMtZWFzdC0yMKQG.m3u8
-      // Extract the edge URL host and add it to URL so proxy can fetch
-      const resp = await axios.get("https://" + host + pathname);
-      // const re = /https:\/\/(.*)\/v1\/segment\/(.*)/g;
-      // const match = re.exec(resp.data);
-      // const edgehost = match?.[1];
-      // const repl = resp.data.replaceAll(
-      //   re,
-      //   `/proxy/v1/segment/$2?host=${edgehost}`,
-      // );
-      const repl = resp.data;
-      res.send(repl);
-    } else if (pathname.endsWith(".ts")) {
-      // Segment
-      const resp = await axios.get("https://" + host + pathname, {
-        responseType: "arraybuffer",
-      });
-      res.writeHead(200, {
-        "Content-Type": "application/octet-stream",
-        "Accept-Ranges": "bytes",
-        "Content-Length": resp.data.length,
-        "Transfer-Encoding": "chunked",
-      });
-      res.write(resp.data);
-      res.end();
-    } else {
-      res.status(404);
-      res.end();
-    }
-  } catch (e) {
-    // console.log(e);
-    console.log("proxy failed: %s", req.url);
-  }
-});
-
-app.use(express.static(config.BUILD_DIRECTORY));
-// Send index.html for all other requests (SPA)
-app.use("/*splat", (_req, res) => {
-  res.sendFile(
-    path.resolve(
-      import.meta.dirname + `/../${config.BUILD_DIRECTORY}/index.html`,
-    ),
-  );
-});
-
-async function saveRooms() {
-  // Unload rooms that are empty and idle
-  // Frees up some JS memory space when process is long-running
-  // On reconnect, we'll attempt to reload the room
-  let saveCount = 0;
-  let skipCount = 0;
-  const start = Date.now();
-  await Promise.all(
-    Array.from(rooms.entries()).map(async ([key, room]) => {
-      if (
-        room.roster.length === 0 &&
-        !room.vBrowser &&
-        Number(room.lastUpdateTime) < Date.now() - 8 * 60 * 60 * 1000
-      ) {
-        console.log(
-          "freeing room %s from memory on shard %s",
-          key,
-          config.SHARD,
-        );
-        await room.saveRoom();
-        room.destroy();
-        rooms.delete(key);
-        saveCount += 1;
-        // Unregister the namespace to avoid dupes on reload
-        io._nsps.delete(key);
-      } else if (room.roster.length) {
-        room.lastUpdateTime = new Date();
-        await room.saveRoom();
-        saveCount += 1;
-      } else {
-        skipCount += 1;
-      }
-    }),
-  );
-  const end = Date.now();
-  console.log(
-    "[SAVEROOMS] %s saved in %sms, %s skipped",
-    saveCount,
-    end - start,
-    skipCount,
-  );
-}
-
-async function release() {
-  // Reset VMs in rooms that are:
-  // older than the session limit
-  // assigned to a room with no users
-  const roomArr = Array.from(rooms.values());
-  console.log("[RELEASE] %s rooms in batch", roomArr.length);
-  for (let room of roomArr) {
-    if (room.vBrowser && room.vBrowser.assignTime) {
-      const maxTime = getSessionLimitSeconds(room.vBrowser.large) * 1000;
-      const elapsed = Date.now() - room.vBrowser.assignTime;
-      const ttl = maxTime - elapsed;
-      const isTimedOut = ttl && ttl < releaseInterval;
-      const isAlmostTimedOut = ttl && ttl < releaseInterval * 2;
-      const isRoomEmpty = room.roster.length === 0;
-      const isRoomIdle =
-        Date.now() - Number(room.lastUpdateTime) > 5 * 60 * 1000;
-      if (isTimedOut || (isRoomEmpty && isRoomIdle)) {
-        console.log("[RELEASE] VM in room:", room.roomId);
-        room.stopVBrowserInternal();
-        if (isTimedOut) {
-          room.addChatMessage(null, {
-            id: "",
-            system: true,
-            cmd: "vBrowserTimeout",
-            msg: "",
-          });
-          redisCount("vBrowserTerminateTimeout");
-        } else if (isRoomEmpty) {
-          redisCount("vBrowserTerminateEmpty");
-        }
-      } else if (isAlmostTimedOut) {
-        room.addChatMessage(null, {
-          id: "",
-          system: true,
-          cmd: "vBrowserAlmostTimeout",
-          msg: "",
-        });
-      }
-    }
-    // We want to spread out the jobs over about half the release interval
-    // This gives other jobs some CPU time
-    const waitTime = releaseInterval / 2 / roomArr.length;
-    await new Promise((resolve) => setTimeout(resolve, waitTime));
+    const data = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    return Number(data.exp) > Date.now();
+  } catch {
+    return false;
   }
 }
 
-async function minuteMetrics() {
-  const roomArr = Array.from(rooms.values());
-  let vbWaiting = 0;
-  for (let room of roomArr) {
-    if (room.vBrowser && room.vBrowser.id) {
-      // Update the heartbeat
-      await postgres?.query(
-        `UPDATE vbrowser SET "heartbeatTime" = NOW() WHERE "roomId" = $1 and vmid = $2`,
-        [room.roomId, room.vBrowser.id],
-      );
+function serializeCookie(
+  name: string,
+  value: string,
+  options: {
+    httpOnly: boolean;
+    maxAge: number;
+    path: string;
+    sameSite: "Lax" | "Strict";
+    secure: boolean;
+  },
+) {
+  return [
+    `${name}=${encodeURIComponent(value)}`,
+    `Max-Age=${options.maxAge}`,
+    `Path=${options.path}`,
+    `SameSite=${options.sameSite}`,
+    options.httpOnly ? "HttpOnly" : "",
+    options.secure ? "Secure" : "",
+  ]
+    .filter(Boolean)
+    .join("; ");
+}
 
-      const expireTime = getStartOfDay() / 1000 + 86400;
-      if (room.vBrowser?.creatorClientID) {
-        await redis?.zincrby(
-          "vBrowserClientIDMinutes",
-          1,
-          room.vBrowser.creatorClientID,
-        );
-        await redis?.expireat("vBrowserClientIDMinutes", expireTime);
-      }
-      if (room.vBrowser?.creatorUID) {
-        await redis?.zincrby(
-          "vBrowserUIDMinutes",
-          1,
-          room.vBrowser?.creatorUID,
-        );
-        await redis?.expireat("vBrowserUIDMinutes", expireTime);
-      }
+function parseCookies(header: string | undefined) {
+  const cookies: Record<string, string> = {};
+  for (const part of (header ?? "").split(";")) {
+    const [name, ...valueParts] = part.trim().split("=");
+    if (name) {
+      cookies[name] = decodeURIComponent(valueParts.join("="));
     }
-    const users = room.roster.length;
-    if (users) {
-      await redis?.setex(`roomCounts:${room.roomId}`, 120, users);
-      await redis?.setex(
-        `roomRosters:${room.roomId}`,
-        120,
-        JSON.stringify(room.getRosterForStats()),
-      );
-    }
-    vbWaiting += room.vBrowserQueue ? 1 : 0;
   }
-  // Report shard metrics
-  const obj: ShardMetric = {
-    uptime: process.uptime(),
-    mem: process.memoryUsage().rss,
-    roomCount: rooms.size,
-    users: io.engine.clientsCount,
-    vbWaiting,
+  return cookies;
+}
+
+async function listMediaDirectory(root: string, relativeDir: string): Promise<MediaEntry[]> {
+  const rootReal = await fs.realpath(root);
+  const targetDir = await resolveSafeMediaPath(rootReal, relativeDir);
+  const entries = await fs.readdir(targetDir, { withFileTypes: true });
+  const out: SortableMediaEntry[] = [];
+  for (const entry of entries) {
+    const fullPath = path.join(targetDir, entry.name);
+    const real = await fs.realpath(fullPath);
+    const stats = await fs.stat(real);
+    const relative = normalizeMediaRelativePath(path.relative(rootReal, real));
+    if (!isSafeRelativePath(relative)) {
+      continue;
+    }
+    if (entry.isDirectory()) {
+      out.push({
+        type: "directory",
+        name: entry.name,
+        path: relative,
+        modifiedMs: stats.mtimeMs,
+      });
+      continue;
+    }
+    if (entry.isFile() && SUPPORTED_EXTENSIONS.has(path.extname(entry.name).toLowerCase())) {
+      out.push({ ...makeMediaFile(relative), modifiedMs: stats.mtimeMs });
+    }
+  }
+  return out.sort(sortMediaEntries).map(stripModifiedMs);
+}
+
+async function searchMediaFiles(root: string, query: string): Promise<PlaylistItem[]> {
+  const rootReal = await fs.realpath(root);
+  const out: SortablePlaylistItem[] = [];
+  await walk(rootReal);
+  return out
+    .sort((a, b) => b.modifiedMs - a.modifiedMs || a.name.localeCompare(b.name))
+    .map(stripPlaylistModifiedMs);
+
+  async function walk(dir: string) {
+    const entries = await fs.readdir(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await walk(fullPath);
+        continue;
+      }
+      if (!entry.isFile() || !SUPPORTED_EXTENSIONS.has(path.extname(entry.name).toLowerCase())) {
+        continue;
+      }
+      const real = await fs.realpath(fullPath);
+      const relative = normalizeMediaRelativePath(path.relative(rootReal, real));
+      if (!isSafeRelativePath(relative)) {
+        continue;
+      }
+      if (query && !relative.toLowerCase().includes(query)) {
+        continue;
+      }
+      const stats = await fs.stat(real);
+      out.push({ ...makeMediaFile(relative), modifiedMs: stats.mtimeMs });
+    }
+  }
+}
+
+function sortMediaEntries(a: SortableMediaEntry, b: SortableMediaEntry) {
+  if (a.type !== b.type) {
+    return a.type === "directory" ? -1 : 1;
+  }
+  return b.modifiedMs - a.modifiedMs || a.name.localeCompare(b.name);
+}
+
+function stripModifiedMs(entry: SortableMediaEntry): MediaEntry {
+  const { modifiedMs: _modifiedMs, ...rest } = entry;
+  return rest;
+}
+
+function stripPlaylistModifiedMs(entry: SortablePlaylistItem): PlaylistItem {
+  const { modifiedMs: _modifiedMs, ...rest } = entry;
+  return rest;
+}
+
+async function resolveSafeMediaPath(rootReal: string, relativeInput: string) {
+  const normalized = normalizeMediaRelativePath(relativeInput);
+  if (!isSafeRelativePath(normalized)) {
+    return rootReal;
+  }
+  const target = path.resolve(rootReal, normalized);
+  const real = await fs.realpath(target);
+  const relative = normalizeMediaRelativePath(path.relative(rootReal, real));
+  if (!isSafeRelativePath(relative)) {
+    return rootReal;
+  }
+  return real;
+}
+
+function makeMediaFile(relative: string): PlaylistItem {
+  return {
+    url: `${MEDIA_BASE_URL}/${relative.split("/").map(encodeURIComponent).join("/")}`,
+    name: relative,
+    duration: 0,
+    type: "file",
   };
-  await redis?.setex(
-    `shardMetrics:${config.SHARD ?? 0}`,
-    120,
-    JSON.stringify(obj),
-  );
 }
 
-function computeOpenSubtitlesHash(first: Buffer, last: Buffer, size: number) {
-  // console.log(first.length, last.length, size);
-  let temp = BigInt(size);
-  process(first);
-  process(last);
+function normalizeMediaRelativePath(input: string) {
+  return input.replaceAll("\\", "/").replace(/^\/+/, "");
+}
 
-  temp = temp & BigInt("0xffffffffffffffff");
-  return temp.toString(16).padStart(16, "0");
+function isSafeRelativePath(input: string) {
+  return input === "" || (!input.startsWith("../") && input !== ".." && !path.isAbsolute(input));
+}
 
-  function process(chunk: Buffer) {
-    for (let i = 0; i < chunk.length; i += 8) {
-      const long = chunk.readBigUInt64LE(i);
-      temp += long;
+function getHostState(): HostState {
+  return {
+    video: state.video,
+    videoTS: state.videoTS,
+    paused: state.paused,
+    playbackRate: state.playbackRate,
+    loop: state.loop,
+  };
+}
+
+function setHost(url: string, clientId?: string, label?: string) {
+  const cleanUrl = url.trim().slice(0, 4000);
+  if (cleanUrl && !isAllowedMediaUrl(cleanUrl)) {
+    return;
+  }
+  const previousVideo = state.video;
+  state.video = cleanUrl;
+  state.videoTS = 0;
+  state.paused = !cleanUrl;
+  state.playbackRate = 1;
+  state.loop = false;
+  state.tsMap = {};
+  io.emit("REC:host", getHostState());
+  io.emit("REC:tsMap", state.tsMap);
+  if (clientId && previousVideo !== cleanUrl) {
+    addSystemChat(
+      clientId,
+      cleanUrl ? `switched video to: ${label || mediaNameFromUrl(cleanUrl)}` : "cleared the video",
+    );
+  }
+}
+
+function playlistNext(clientId?: string) {
+  const next = state.playlist.shift();
+  io.emit("playlist", state.playlist);
+  if (next) {
+    setHost(next.url, clientId, next.name);
+  } else {
+    setHost("", clientId);
+  }
+}
+
+function makePlaylistItem(url: string): PlaylistItem | null {
+  const cleanUrl = url.trim().slice(0, 4000);
+  if (!isAllowedMediaUrl(cleanUrl)) {
+    return null;
+  }
+  return {
+    url: cleanUrl,
+    name: mediaNameFromUrl(cleanUrl),
+    duration: 0,
+    type: "file",
+  };
+}
+
+function isAllowedMediaUrl(url: string) {
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "https:" || parsed.protocol === "http:";
+  } catch {
+    return false;
+  }
+}
+
+function mediaNameFromUrl(url: string) {
+  try {
+    const parsed = new URL(url);
+    const last = decodeURIComponent(parsed.pathname.split("/").filter(Boolean).at(-1) ?? url);
+    return last || url;
+  } catch {
+    return url;
+  }
+}
+
+function addChat(message: ChatMessage) {
+  state.chat.push(message);
+  state.chat = state.chat.slice(-100);
+  io.emit("REC:chat", message);
+}
+
+function addSystemChat(clientId: string, msg: string) {
+  addChat({
+    id: "",
+    name: state.names[clientId] || "Guest",
+    msg,
+    timestamp: new Date().toISOString(),
+    videoTS: state.tsMap[clientId],
+  });
+}
+
+function syncRoster() {
+  const connectedClientIds = new Set<string>();
+  for (const [clientId, socketId] of socketByClientId) {
+    const socket = io.sockets.sockets.get(socketId);
+    if (socket?.connected) {
+      connectedClientIds.add(clientId);
+    } else {
+      socketByClientId.delete(clientId);
+      delete state.tsMap[clientId];
     }
   }
+  state.roster = Array.from(connectedClientIds)
+    .sort((a, b) => (state.names[a] || "Guest").localeCompare(state.names[b] || "Guest"))
+    .map((id) => ({ id, name: state.names[id] || "Guest" }));
+}
+
+function emitRoster() {
+  io.emit("roster", state.roster);
+}
+
+function sanitizeClientId(input: unknown) {
+  const value = String(input ?? "");
+  if (/^[0-9a-f-]{36}$/i.test(value)) {
+    return value;
+  }
+  return crypto.randomUUID();
+}
+
+function clampTime(value: number) {
+  return Number.isFinite(value) && value > 0 ? Math.min(value, 7 * 24 * 60 * 60) : 0;
+}
+
+function clampPlaybackRate(value: number) {
+  return [0.25, 0.5, 1, 1.5, 2].includes(value) ? value : 1;
+}
+
+function formatTimestamp(value: number) {
+  const total = Math.max(0, Math.floor(value));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60).toString().padStart(2, "0");
+  const seconds = (total % 60).toString().padStart(2, "0");
+  return hours ? `${hours}:${minutes}:${seconds}` : `${minutes}:${seconds}`;
+}
+
+function normalizeBase(input: string) {
+  const withSlash = input.startsWith("/") ? input : `/${input}`;
+  return withSlash.endsWith("/") ? withSlash.slice(0, -1) : withSlash;
 }
