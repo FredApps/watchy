@@ -3,6 +3,7 @@ import "./index.css";
 import React, { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { io, type Socket } from "socket.io-client";
+import { chatEmojiCategories, chatEmojiSearchText, chatEmojiShortcodes } from "./emojiData";
 
 type PlaylistItem = {
   url: string;
@@ -22,6 +23,7 @@ type MediaEntry = PlaylistItem | MediaDirectory;
 type ChatMessage = {
   id: string;
   name: string;
+  actorId?: string;
   msg: string;
   timestamp: string;
   videoTS?: number;
@@ -56,6 +58,22 @@ type SplashReaction = {
 const basePath = "/watchy";
 const apiPath = `${basePath}/api`;
 const defaultChatWidth = 266;
+
+type EmojiSuggestion = { code: string; emoji: string };
+const shortcodeList = Object.keys(chatEmojiShortcodes).sort();
+function lookupEmojiSuggestions(query: string, limit = 8): EmojiSuggestion[] {
+  const q = query.toLowerCase();
+  const starts: string[] = [];
+  const contains: string[] = [];
+  for (const code of shortcodeList) {
+    if (code.startsWith(q)) {
+      starts.push(code);
+    } else if (code.includes(q)) {
+      contains.push(code);
+    }
+  }
+  return [...starts, ...contains].slice(0, limit).map((code) => ({ code, emoji: chatEmojiShortcodes[code] }));
+}
 const emojiValues = [
   "\u{1F600}",
   "\u{1F603}",
@@ -97,85 +115,6 @@ const emojiValues = [
   "\u{2764}\u{FE0F}",
   "\u{1F389}",
 ];
-const chatEmojiCategories = [
-  {
-    id: "faces",
-    label: "Faces",
-    values: [
-      "\u{1F600}",
-      "\u{1F603}",
-      "\u{1F604}",
-      "\u{1F601}",
-      "\u{1F606}",
-      "\u{1F605}",
-      "\u{1F602}",
-      "\u{1F923}",
-      "\u{1F642}",
-      "\u{1F60A}",
-      "\u{1F607}",
-      "\u{1F970}",
-      "\u{1F60D}",
-      "\u{1F929}",
-      "\u{1F618}",
-      "\u{1F97A}",
-    ],
-  },
-  {
-    id: "gestures",
-    label: "Hands",
-    values: ["\u{1F44D}", "\u{1F44F}", "\u{1F4AA}", "\u{1F64F}", "\u{1F44B}", "\u{1F91D}"],
-  },
-  {
-    id: "watch",
-    label: "Watch",
-    values: ["\u{2764}\u{FE0F}", "\u{1F525}", "\u{2728}", "\u{1F37F}", "\u{1F389}", "\u{1F48B}", "\u{1F440}", "\u{1F62D}"],
-  },
-  {
-    id: "weird",
-    label: "Weird",
-    values: ["\u{1F916}", "\u{1F434}", "\u{1F422}", "\u{1F47B}", "\u{1F479}", "\u{1F913}", "\u{1F978}", "\u{1F927}"],
-  },
-];
-const chatEmojiSearchText: Record<string, string> = {
-  "\u{1F600}": "grinning smile happy",
-  "\u{1F603}": "smile happy",
-  "\u{1F604}": "smile laugh happy",
-  "\u{1F601}": "grin smile",
-  "\u{1F606}": "laugh squint",
-  "\u{1F605}": "sweat smile",
-  "\u{1F602}": "joy laugh tears",
-  "\u{1F923}": "rofl laugh rolling",
-  "\u{1F642}": "slight smile",
-  "\u{1F60A}": "blush smile",
-  "\u{1F607}": "angel innocent",
-  "\u{1F970}": "hearts love",
-  "\u{1F60D}": "heart eyes love",
-  "\u{1F929}": "star eyes wow",
-  "\u{1F618}": "kiss",
-  "\u{1F97A}": "pleading puppy",
-  "\u{1F44D}": "thumbs up like",
-  "\u{1F44F}": "clap applause",
-  "\u{1F4AA}": "muscle strong",
-  "\u{1F64F}": "pray please thanks",
-  "\u{1F44B}": "wave hello",
-  "\u{1F91D}": "handshake",
-  "\u{2764}\u{FE0F}": "heart love",
-  "\u{1F525}": "fire hot",
-  "\u{2728}": "sparkles sparkle",
-  "\u{1F37F}": "popcorn",
-  "\u{1F389}": "party celebrate",
-  "\u{1F48B}": "kiss lips",
-  "\u{1F440}": "eyes look",
-  "\u{1F62D}": "sob crying tears",
-  "\u{1F916}": "robot",
-  "\u{1F434}": "horse",
-  "\u{1F422}": "turtle",
-  "\u{1F47B}": "ghost",
-  "\u{1F479}": "ogre monster",
-  "\u{1F913}": "nerd glasses",
-  "\u{1F978}": "disguise",
-  "\u{1F927}": "sneeze sick",
-};
 const splashValues = [
   "\u{1F916}",
   "\u{1F496}",
@@ -289,6 +228,12 @@ function WatchRoom() {
   const [nameColor, setNameColor] = useState(localStorage.getItem("watchy-name-color") || "#f5f7f8");
   const [urlInput, setUrlInput] = useState("");
   const [chatInput, setChatInput] = useState("");
+  const [emojiSuggest, setEmojiSuggest] = useState<{
+    items: EmojiSuggestion[];
+    index: number;
+    start: number;
+    end: number;
+  } | null>(null);
   const [editingMessage, setEditingMessage] = useState<ChatMessage | null>(null);
   const [replyingTo, setReplyingTo] = useState<ChatMessage | null>(null);
   const [emojiPickerOpen, setEmojiPickerOpen] = useState(false);
@@ -310,6 +255,8 @@ function WatchRoom() {
   const [chatOpen, setChatOpen] = useState(true);
   const [chatWidth, setChatWidth] = useState(Number(localStorage.getItem("watchy-chat-width") ?? String(defaultChatWidth)));
   const [rosterOpen, setRosterOpen] = useState(false);
+  const [renamingUser, setRenamingUser] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState("");
   const [isTheater, setIsTheater] = useState(false);
   const [autoTheaterAttempted, setAutoTheaterAttempted] = useState(false);
   const [resumeTheater, setResumeTheater] = useState(getCookie("watchy_resume_theater") !== "0");
@@ -319,6 +266,9 @@ function WatchRoom() {
   const controlsRef = useRef<HTMLDivElement | null>(null);
   const reactionRowRef = useRef<HTMLDivElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const messagesRef = useRef<HTMLDivElement | null>(null);
+  const stickToBottomRef = useRef(true);
+  const chatInputRef = useRef<HTMLInputElement | null>(null);
   const shouldPlayRef = useRef(false);
   const hlsRef = useRef<any>(null);
   const clientId = useMemo(getOrCreateClientId, []);
@@ -527,9 +477,18 @@ function WatchRoom() {
       const isFullscreen = Boolean(document.fullscreenElement);
       const mediaReserve = isFullscreen ? 0 : 96;
       const rowCount = isFullscreen ? 3 : controlsHeight > 0 ? 4 : 3;
+      // In normal (windowed) mode, the column is sized to 100vh which can extend
+      // under the OS taskbar/status bar, hiding the bottom controls. Bound the
+      // stage by the actually-visible viewport and keep a small safe margin so
+      // the controls stay on screen (shrinking the video to fit).
+      const columnTop = column.getBoundingClientRect().top;
+      const safeBottom = isFullscreen ? 0 : 24;
+      const availableHeight = isFullscreen
+        ? column.clientHeight
+        : Math.min(column.clientHeight, window.innerHeight - columnTop - safeBottom);
       const maxStageHeight = Math.max(
         160,
-        column.clientHeight - paddingY - controlsHeight - reactionsHeight - mediaReserve - gap * (rowCount - 1),
+        availableHeight - paddingY - controlsHeight - reactionsHeight - mediaReserve - gap * (rowCount - 1),
       );
       const ratio = Number.isFinite(videoAspectRatio) && videoAspectRatio > 0 ? videoAspectRatio : 16 / 9;
       const width = Math.min(contentWidth, maxStageHeight * ratio);
@@ -652,6 +611,7 @@ function WatchRoom() {
     }
     setChatInput("");
     setEmojiPickerOpen(false);
+    scrollChatToBottom();
   }
 
   function submitName(event: FormEvent) {
@@ -670,6 +630,7 @@ function WatchRoom() {
     setEditingMessage(message);
     setReplyingTo(null);
     setChatInput(message.msg);
+    requestAnimationFrame(() => chatInputRef.current?.focus());
   }
 
   function cancelEditing() {
@@ -681,6 +642,8 @@ function WatchRoom() {
     setReplyingTo(message);
     setEditingMessage(null);
     setChatInput("");
+    scrollChatToBottom();
+    requestAnimationFrame(() => chatInputRef.current?.focus());
   }
 
   function cancelReply() {
@@ -689,6 +652,81 @@ function WatchRoom() {
 
   function addChatEmoji(value: string) {
     setChatInput((current) => `${current}${value}`);
+    scrollChatToBottom();
+  }
+
+  function handleChatInputChange(event: React.ChangeEvent<HTMLInputElement>) {
+    const value = event.target.value;
+    setChatInput(value);
+    const caret = event.target.selectionStart ?? value.length;
+    const match = /(?:^|\s):([a-zA-Z0-9_+-]{1,})$/.exec(value.slice(0, caret));
+    if (match) {
+      const items = lookupEmojiSuggestions(match[1]);
+      if (items.length) {
+        setEmojiSuggest({ items, index: 0, start: caret - match[1].length - 1, end: caret });
+        return;
+      }
+    }
+    setEmojiSuggest(null);
+  }
+
+  function applyEmojiSuggestion(item: EmojiSuggestion) {
+    if (!emojiSuggest) {
+      return;
+    }
+    const { start, end } = emojiSuggest;
+    const next = `${chatInput.slice(0, start)}${item.emoji} ${chatInput.slice(end)}`;
+    setChatInput(next);
+    setEmojiSuggest(null);
+    const caret = start + item.emoji.length + 1;
+    requestAnimationFrame(() => {
+      const el = chatInputRef.current;
+      if (el) {
+        el.focus();
+        el.setSelectionRange(caret, caret);
+      }
+    });
+  }
+
+  function handleChatInputKeyDown(event: React.KeyboardEvent<HTMLInputElement>) {
+    if (!emojiSuggest) {
+      return;
+    }
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      setEmojiSuggest((s) => s && { ...s, index: (s.index + 1) % s.items.length });
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      setEmojiSuggest((s) => s && { ...s, index: (s.index - 1 + s.items.length) % s.items.length });
+    } else if (event.key === "Enter" || event.key === "Tab") {
+      event.preventDefault();
+      applyEmojiSuggestion(emojiSuggest.items[emojiSuggest.index]);
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      setEmojiSuggest(null);
+    }
+  }
+
+  function startRenameUser(user: User) {
+    setRenamingUser(user.id);
+    setRenameValue(nameMap[user.id] || user.name);
+  }
+
+  function submitRenameUser(event: FormEvent) {
+    event.preventDefault();
+    const name = renameValue.trim();
+    if (renamingUser && name) {
+      if (renamingUser === clientId) {
+        setName(name);
+        localStorage.setItem("watchy-name", name);
+        setCookie("watchy_name", name, 3650);
+        socket?.emit("CMD:name", name);
+      } else {
+        socket?.emit("CMD:renameUser", { id: renamingUser, name });
+      }
+    }
+    setRenamingUser(null);
+    setRenameValue("");
   }
 
   function toggleMessageReaction(message: ChatMessage, value: string) {
@@ -697,6 +735,7 @@ function WatchRoom() {
       value,
     });
     setReactionPickerFor(null);
+    scrollChatToBottom();
   }
 
   function togglePlay() {
@@ -712,6 +751,59 @@ function WatchRoom() {
 
   function seek(value: number) {
     socket?.emit("CMD:seek", value);
+  }
+
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if (!socket || !host.video) {
+        return;
+      }
+      if (event.ctrlKey || event.metaKey || event.altKey) {
+        return;
+      }
+      const target = event.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.tagName === "SELECT" ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+      if (event.code === "Space" || event.key === " ") {
+        event.preventDefault();
+        togglePlay();
+      } else if (event.key === "ArrowLeft") {
+        event.preventDefault();
+        const current = videoRef.current?.currentTime ?? 0;
+        seek(Math.max(0, current - 5));
+      } else if (event.key === "ArrowRight") {
+        event.preventDefault();
+        const current = videoRef.current?.currentTime ?? 0;
+        const max = videoRef.current?.duration || duration || Infinity;
+        seek(Math.min(max, current + 5));
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [socket, host.video, duration]);
+
+  useEffect(() => {
+    const el = messagesRef.current;
+    if (el && stickToBottomRef.current) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [chat]);
+
+  function scrollChatToBottom() {
+    stickToBottomRef.current = true;
+    requestAnimationFrame(() => {
+      const el = messagesRef.current;
+      if (el) {
+        el.scrollTop = el.scrollHeight;
+      }
+    });
   }
 
   function syncToLeader() {
@@ -851,7 +943,7 @@ function WatchRoom() {
           )}
           <div className="splash-layer">
             {splashes.map((splash) => (
-              <span key={splash.id} className="splash" style={splashStyle(splash)}>
+              <span key={splash.id} className="splash" style={splashStyle(splash, colorMap[splash.user])}>
                 {splash.value}
               </span>
             ))}
@@ -1035,18 +1127,53 @@ function WatchRoom() {
                 {roster.map((user) => (
                   <div className="roster-item" key={user.id}>
                     <span className="roster-dot" style={{ background: colorMap[user.id] || "#8d989f" }} />
-                    <span>{nameMap[user.id] || user.name}</span>
+                    {renamingUser === user.id ? (
+                      <form className="roster-rename" onSubmit={submitRenameUser}>
+                        <input
+                          autoFocus
+                          value={renameValue}
+                          maxLength={40}
+                          onChange={(event) => setRenameValue(event.target.value)}
+                          onBlur={() => setRenamingUser(null)}
+                          onKeyDown={(event) => {
+                            if (event.key === "Escape") {
+                              setRenamingUser(null);
+                            }
+                          }}
+                        />
+                      </form>
+                    ) : (
+                      <>
+                        <span className="roster-name">{nameMap[user.id] || user.name}</span>
+                        <button
+                          type="button"
+                          className="icon-button roster-rename-button"
+                          title="Rename"
+                          onMouseDown={(event) => event.preventDefault()}
+                          onClick={() => startRenameUser(user)}
+                        >
+                          {"✎"}
+                        </button>
+                      </>
+                    )}
                   </div>
                 ))}
               </div>
             )}
           </div>
-          <div className="messages">
+          <div
+            className="messages"
+            ref={messagesRef}
+            onScroll={(event) => {
+              const el = event.currentTarget;
+              stickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+            }}
+          >
             {chat.map((message) => (
               <div className={message.id ? "message" : "message system"} key={`${message.timestamp}-${message.id}-${message.msg}`}>
                 <div className="message-meta">
-                  <strong style={{ color: message.id ? colorMap[message.id] : undefined }}>
-                    {message.id ? nameMap[message.id] || message.name : message.name}
+                  <strong style={{ color: colorMap[message.id || message.actorId || ""] || undefined }}>
+                    {nameMap[message.id || message.actorId || ""] || message.name}
                   </strong>
                   <span>{new Date(message.timestamp).toLocaleTimeString()}</span>
                   {message.videoTS != null && <span>@ {formatTimestamp(message.videoTS)}</span>}
@@ -1148,12 +1275,14 @@ function WatchRoom() {
                     key={category.id}
                     type="button"
                     className={!emojiSearch && emojiCategory === category.id ? "active" : ""}
+                    title={category.label}
+                    aria-label={category.label}
                     onClick={() => {
                       setEmojiCategory(category.id);
                       setEmojiSearch("");
                     }}
                   >
-                    {category.label}
+                    {category.icon}
                   </button>
                 ))}
               </div>
@@ -1167,18 +1296,45 @@ function WatchRoom() {
               </div>
             </div>
           )}
-          <form className="chat-form" onSubmit={submitChat}>
-            <button
-              type="button"
-              className={emojiPickerOpen ? "active" : ""}
-              onClick={() => setEmojiPickerOpen((open) => !open)}
-              title="Emoji"
-            >
-              {"\u{1F600}"}
-            </button>
-            <input value={chatInput} onChange={(event) => setChatInput(event.target.value)} placeholder="Message..." />
-            <button type="submit">{editingMessage ? "Save" : "Send"}</button>
-          </form>
+          <div className="chat-input-wrap">
+            {emojiSuggest && (
+              <div className="emoji-suggest">
+                {emojiSuggest.items.map((item, i) => (
+                  <button
+                    type="button"
+                    key={item.code}
+                    className={i === emojiSuggest.index ? "active" : ""}
+                    onMouseDown={(event) => {
+                      event.preventDefault();
+                      applyEmojiSuggestion(item);
+                    }}
+                  >
+                    <span className="se">{item.emoji}</span>
+                    <span className="sc">:{item.code}:</span>
+                  </button>
+                ))}
+              </div>
+            )}
+            <form className="chat-form" onSubmit={submitChat}>
+              <button
+                type="button"
+                className={emojiPickerOpen ? "active" : ""}
+                onClick={() => setEmojiPickerOpen((open) => !open)}
+                title="Emoji"
+              >
+                {"\u{1F600}"}
+              </button>
+              <input
+                ref={chatInputRef}
+                value={chatInput}
+                onChange={handleChatInputChange}
+                onKeyDown={handleChatInputKeyDown}
+                onBlur={() => setEmojiSuggest(null)}
+                placeholder="Message..."
+              />
+              <button type="submit">{editingMessage ? "Save" : "Send"}</button>
+            </form>
+          </div>
         </section>
           </>
         )}
@@ -1189,42 +1345,234 @@ function WatchRoom() {
 
 function renderMarkdown(input: string): React.ReactNode[] {
   const lines = input.split("\n");
-  return lines.flatMap((line, index) => [
-    ...renderMarkdownLine(line, `line-${index}`),
-    ...(index < lines.length - 1 ? [<br key={`br-${index}`} />] : []),
-  ]);
+  const bulletPattern = /^\s*[-*]\s+(.*)$/;
+  const orderedPattern = /^\s*\d+[.)]\s+(.*)$/;
+  const headerPattern = /^(#{1,3})\s+(.*)$/;
+  const subtextPattern = /^-#\s+(.*)$/;
+  const quotePattern = /^>\s?(.*)$/;
+  const fencePattern = /^```/;
+
+  const blocks: React.ReactNode[] = [];
+  let para: React.ReactNode[] = [];
+  let listItems: React.ReactNode[] = [];
+  let listType: "ul" | "ol" | null = null;
+  let blockKey = 0;
+
+  const flushPara = () => {
+    if (para.length) {
+      blocks.push(<span key={`p-${blockKey++}`}>{para}</span>);
+      para = [];
+    }
+  };
+  const flushList = () => {
+    if (listItems.length) {
+      const items = listItems;
+      blocks.push(
+        listType === "ol" ? (
+          <ol key={`l-${blockKey++}`} className="chat-list">
+            {items}
+          </ol>
+        ) : (
+          <ul key={`l-${blockKey++}`} className="chat-list">
+            {items}
+          </ul>
+        ),
+      );
+      listItems = [];
+      listType = null;
+    }
+  };
+  const flushBlocks = () => {
+    flushPara();
+    flushList();
+  };
+
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index];
+
+    // Fenced code block: ```optional-lang ... ```
+    if (fencePattern.test(line.trim())) {
+      flushBlocks();
+      const codeLines: string[] = [];
+      index++;
+      while (index < lines.length && !fencePattern.test(lines[index].trim())) {
+        codeLines.push(lines[index]);
+        index++;
+      }
+      blocks.push(
+        <pre key={`code-${blockKey++}`} className="chat-codeblock">
+          <code>{codeLines.join("\n")}</code>
+        </pre>,
+      );
+      continue;
+    }
+
+    // Blockquote: group consecutive `> ` (or `>>> `) lines.
+    const tripleQuote = line.startsWith(">>> ");
+    if (tripleQuote || quotePattern.test(line)) {
+      flushBlocks();
+      const quoteLines: React.ReactNode[] = [];
+      if (tripleQuote) {
+        // `>>> ` quotes everything that follows.
+        const first = line.slice(4);
+        quoteLines.push(...renderMarkdownLine(first, `q-${index}`));
+        index++;
+        while (index < lines.length) {
+          quoteLines.push(<br key={`qbr-${index}`} />, ...renderMarkdownLine(lines[index], `q-${index}`));
+          index++;
+        }
+      } else {
+        let first = true;
+        while (index < lines.length && quotePattern.test(lines[index])) {
+          const content = quotePattern.exec(lines[index])![1];
+          if (!first) {
+            quoteLines.push(<br key={`qbr-${index}`} />);
+          }
+          quoteLines.push(...renderMarkdownLine(content, `q-${index}`));
+          first = false;
+          index++;
+        }
+        index--; // for-loop will increment
+      }
+      blocks.push(
+        <blockquote key={`quote-${blockKey++}`} className="chat-quote">
+          {quoteLines}
+        </blockquote>,
+      );
+      continue;
+    }
+
+    const subtext = subtextPattern.exec(line);
+    const header = headerPattern.exec(line);
+    const bullet = bulletPattern.exec(line);
+    const ordered = orderedPattern.exec(line);
+
+    if (subtext) {
+      flushBlocks();
+      blocks.push(
+        <div key={`sub-${blockKey++}`} className="chat-subtext">
+          {renderMarkdownLine(subtext[1], `sub-${index}`)}
+        </div>,
+      );
+    } else if (header) {
+      flushBlocks();
+      const level = header[1].length;
+      blocks.push(
+        <div key={`h-${blockKey++}`} className={`chat-h${level}`}>
+          {renderMarkdownLine(header[2], `h-${index}`)}
+        </div>,
+      );
+    } else if (bullet || ordered) {
+      flushPara();
+      const type = bullet ? "ul" : "ol";
+      if (listType && listType !== type) {
+        flushList();
+      }
+      listType = type;
+      const content = bullet ? bullet[1] : ordered![1];
+      listItems.push(<li key={`li-${index}`}>{renderMarkdownLine(content, `li-${index}`)}</li>);
+    } else {
+      flushList();
+      if (para.length) {
+        para.push(<br key={`br-${index}`} />);
+      }
+      para.push(...renderMarkdownLine(line, `line-${index}`));
+    }
+  }
+  flushBlocks();
+  return blocks;
 }
 
 function renderMarkdownLine(input: string, keyPrefix: string): React.ReactNode[] {
   const nodes: React.ReactNode[] = [];
-  const tokenPattern =
-    /(\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|https?:\/\/[^\s<]+|`([^`]+)`|\*\*([^*]+)\*\*|\*([^*]+)\*)/g;
+  // Ordered by precedence: longer delimiters first so e.g. *** is not eaten by **.
+  const tokenPattern = new RegExp(
+    [
+      "\\[([^\\]]+)\\]\\((https?:\\/\\/[^\\s)]+)\\)", // [text](url)
+      "(https?:\\/\\/[^\\s<]+)", // bare url
+      "`([^`]+)`", // `code`
+      "\\*\\*\\*([\\s\\S]+?)\\*\\*\\*", // ***bold italic***
+      "\\*\\*([\\s\\S]+?)\\*\\*", // **bold**
+      "__([\\s\\S]+?)__", // __underline__
+      "~~([\\s\\S]+?)~~", // ~~strikethrough~~
+      "\\|\\|([\\s\\S]+?)\\|\\|", // ||spoiler||
+      "\\*([\\s\\S]+?)\\*", // *italic*
+      "_([\\s\\S]+?)_", // _italic_
+      ":([a-zA-Z0-9_+-]+):", // :shortcode:
+    ].join("|"),
+    "g",
+  );
   let cursor = 0;
   let match: RegExpExecArray | null;
   while ((match = tokenPattern.exec(input))) {
     if (match.index > cursor) {
       nodes.push(input.slice(cursor, match.index));
     }
-    const [raw, , linkText, linkUrl, codeText, boldText, italicText] = match;
+    const [
+      raw,
+      linkText,
+      linkUrl,
+      bareUrl,
+      codeText,
+      boldItalic,
+      bold,
+      underline,
+      strike,
+      spoiler,
+      italicStar,
+      italicUnderscore,
+      shortcode,
+    ] = match;
     const key = `${keyPrefix}-${match.index}`;
+    const inner = (text: string) => renderMarkdownLine(text, key);
     if (linkUrl && linkText) {
       nodes.push(
         <a key={key} href={linkUrl} target="_blank" rel="noreferrer">
           {linkText}
         </a>,
       );
-    } else if (raw.startsWith("http")) {
+    } else if (bareUrl) {
       nodes.push(
-        <a key={key} href={raw} target="_blank" rel="noreferrer">
-          {raw}
+        <a key={key} href={bareUrl} target="_blank" rel="noreferrer">
+          {bareUrl}
         </a>,
       );
     } else if (codeText) {
       nodes.push(<code key={key}>{codeText}</code>);
-    } else if (boldText) {
-      nodes.push(<strong key={key}>{boldText}</strong>);
-    } else if (italicText) {
-      nodes.push(<em key={key}>{italicText}</em>);
+    } else if (boldItalic) {
+      nodes.push(
+        <strong key={key}>
+          <em>{inner(boldItalic)}</em>
+        </strong>,
+      );
+    } else if (bold) {
+      nodes.push(<strong key={key}>{inner(bold)}</strong>);
+    } else if (underline) {
+      nodes.push(<u key={key}>{inner(underline)}</u>);
+    } else if (strike) {
+      nodes.push(<s key={key}>{inner(strike)}</s>);
+    } else if (spoiler) {
+      nodes.push(
+        <span
+          key={key}
+          className="spoiler"
+          role="button"
+          tabIndex={0}
+          onClick={(event) => event.currentTarget.classList.add("revealed")}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.currentTarget.classList.add("revealed");
+            }
+          }}
+        >
+          {inner(spoiler)}
+        </span>,
+      );
+    } else if (italicStar || italicUnderscore) {
+      nodes.push(<em key={key}>{inner(italicStar || italicUnderscore)}</em>);
+    } else if (shortcode) {
+      const emoji = chatEmojiShortcodes[shortcode.toLowerCase()];
+      nodes.push(emoji ?? raw);
     }
     cursor = match.index + raw.length;
   }
@@ -1333,12 +1681,13 @@ function truncate(input: string, max: number) {
   return input.length > max ? `${input.slice(0, max)}...` : input;
 }
 
-function splashStyle(splash: SplashReaction): React.CSSProperties {
+function splashStyle(splash: SplashReaction, color?: string): React.CSSProperties {
   const seed = Array.from(splash.id).reduce((sum, char) => sum + char.charCodeAt(0), 0);
   return {
     left: `${8 + (seed % 76)}%`,
     top: `${10 + ((seed * 7) % 66)}%`,
-  };
+    "--splash-color": color || "#f5f7f8",
+  } as React.CSSProperties;
 }
 
 createRoot(document.getElementById("root")!).render(<App />);

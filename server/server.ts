@@ -6,6 +6,14 @@ import http from "node:http";
 import path from "node:path";
 import { Server, type Socket } from "socket.io";
 
+// Load .env from the project root so config (password, cookie secret) survives
+// restarts regardless of how the process is launched (e.g. Task Scheduler).
+try {
+  process.loadEnvFile(path.resolve(import.meta.dirname, "../.env"));
+} catch {
+  // No .env file present; fall back to the ambient environment / defaults.
+}
+
 const PORT = Number(process.env.PORT ?? 3090);
 const HOST = process.env.HOST ?? "127.0.0.1";
 const BASE_PATH = normalizeBase(process.env.BASE_PATH ?? "/watchy");
@@ -121,6 +129,7 @@ type SortablePlaylistItem = PlaylistItem & {
 type ChatMessage = {
   id: string;
   name: string;
+  actorId?: string;
   msg: string;
   timestamp: string;
   videoTS?: number;
@@ -274,6 +283,19 @@ io.on("connection", (socket: Socket) => {
   socket.on("CMD:name", (raw: unknown) => {
     const name = String(raw ?? "").trim().slice(0, 40) || "Guest";
     state.names[clientId] = name;
+    syncRoster();
+    io.emit("REC:nameMap", state.names);
+    emitRoster();
+  });
+
+  socket.on("CMD:renameUser", (raw: unknown) => {
+    const payload = (raw ?? {}) as { id?: unknown; name?: unknown };
+    const targetId = String(payload.id ?? "");
+    const name = String(payload.name ?? "").trim().slice(0, 40);
+    if (!/^[0-9a-f-]{36}$/i.test(targetId) || !(targetId in state.names) || !name) {
+      return;
+    }
+    state.names[targetId] = name;
     syncRoster();
     io.emit("REC:nameMap", state.names);
     emitRoster();
@@ -769,6 +791,7 @@ function addChat(message: ChatMessage) {
 function addSystemChat(clientId: string, msg: string) {
   addChat({
     id: "",
+    actorId: clientId,
     name: state.names[clientId] || "Guest",
     msg,
     timestamp: new Date().toISOString(),
