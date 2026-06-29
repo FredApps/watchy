@@ -32,6 +32,8 @@ const MEDIA_BASE_URL = process.env.WATCHY_MEDIA_BASE_URL ?? `${BASE_PATH}/media`
 const BUILD_DIR = path.resolve(import.meta.dirname, "../build");
 const YTDLP_PATH = process.env.YTDLP_PATH ?? "yt-dlp";
 const YT_MAX_HEIGHT = Number(process.env.YT_MAX_HEIGHT ?? 1080);
+const YT_PLAYLIST_MAX_ITEMS = Number(process.env.YT_PLAYLIST_MAX_ITEMS ?? 100);
+const DEBUG_YT_SEEK = process.env.DEBUG_YT_SEEK === "1";
 const SUPPORTED_EXTENSIONS = new Set([".mp4", ".webm", ".m4v", ".mov", ".m3u8"]);
 const MESSAGE_REACTIONS = new Set([
   "\u{1F600}",
@@ -116,6 +118,15 @@ type PlaylistItem = {
   type: "file";
 };
 
+type YouTubeHistoryItem = {
+  kind: "video";
+  id: string;
+  title: string;
+  author: string;
+  duration: string;
+  thumbnail: string;
+};
+
 type MediaDirectory = {
   type: "directory";
   name: string;
@@ -155,6 +166,7 @@ type User = {
 type HostState = {
   video: string;
   videoTS: number;
+  hostSeq: number;
   paused: boolean;
   playbackRate: number;
   loop: boolean;
@@ -162,6 +174,7 @@ type HostState = {
 
 type WatchyState = HostState & {
   playlist: PlaylistItem[];
+  ytHistory: YouTubeHistoryItem[];
   chat: ChatMessage[];
   names: Record<string, string>;
   colors: Record<string, string>;
@@ -172,10 +185,12 @@ type WatchyState = HostState & {
 const state: WatchyState = {
   video: "",
   videoTS: 0,
+  hostSeq: 0,
   paused: true,
   playbackRate: 1,
   loop: false,
   playlist: [],
+  ytHistory: [],
   chat: [],
   names: {},
   colors: {},
@@ -257,21 +272,41 @@ app.get(`${BASE_PATH}/api/yt/search`, requireAuth, async (req, res, next) => {
       return;
     }
     const yt = await getInnertube();
-    const search = await yt.search(query, { type: "video" });
-    const results = search.results
+    const [videoSearch, playlistSearch] = await Promise.all([
+      yt.search(query, { type: "video" }),
+      yt.search(query, { type: "playlist" }),
+    ]);
+    const videos = videoSearch.results
       .filter((r: any) => r.type === "Video" && r.id)
-      .slice(0, 15)
+      .slice(0, 10)
       .map((r: any) => ({
+        kind: "video",
         id: r.id,
-        title: r.title?.text ?? "",
-        author: r.author?.name ?? "",
+        title: textValue(r.title),
+        author: r.author?.name ?? textValue(r.author) ?? "",
         duration: r.duration?.text ?? "",
-        thumbnail: r.thumbnails?.[r.thumbnails.length - 1]?.url ?? r.thumbnails?.[0]?.url ?? "",
+        thumbnail: thumbnailUrl(r.thumbnails),
       }));
-    res.json(results);
+    const playlists = playlistSearch.results
+      .filter((r: any) => youtubePlaylistResultId(r))
+      .slice(0, 8)
+      .map((r: any) => ({
+        kind: "playlist",
+        id: youtubePlaylistResultId(r),
+        title: youtubeResultTitle(r),
+        author: r.author?.name ?? textValue(r.author) ?? "",
+        count: textValue(r.video_count_short) || textValue(r.video_count) || "",
+        duration: "",
+        thumbnail: youtubeResultThumbnail(r),
+      }));
+    res.json([...videos, ...playlists]);
   } catch (error) {
     next(error);
   }
+});
+
+app.get(`${BASE_PATH}/api/yt/history`, requireAuth, (_req, res) => {
+  res.json(state.ytHistory);
 });
 
 app.get(`${BASE_PATH}/api/yt/manifest`, requireAuth, async (req, res, next) => {
@@ -375,19 +410,27 @@ io.on("connection", (socket: Socket) => {
     io.emit("REC:colorMap", state.colors);
   });
 
-  socket.on("CMD:host", async (raw: unknown) => {
-    const url = String(raw ?? "");
-    const ytId = parseYouTubeId(url);
-    if (ytId) {
-      try {
-        const resolved = await resolveYouTube(ytId);
-        setHost(`${BASE_PATH}/api/yt/manifest?v=${ytId}`, clientId, resolved.title);
-      } catch (error) {
-        addSystemChat(clientId, `couldn't load YouTube video (${(error as Error).message})`);
+  socket.on("CMD:host", async (raw: unknown, ack?: () => void) => {
+    try {
+      const url = String(raw ?? "");
+      const yt = parseYouTubeUrl(url);
+      if (yt) {
+        try {
+          const resolved = await resolveYouTube(yt.id);
+          const startParam = yt.startSeconds > 0 ? `&start=${yt.startSeconds}` : "";
+          if (DEBUG_YT_SEEK) {
+            console.info("[watchy:yt-seek] host", { id: yt.id, startSeconds: yt.startSeconds });
+          }
+          setHost(`${BASE_PATH}/api/yt/manifest?v=${yt.id}${startParam}`, clientId, resolved.title, yt.startSeconds);
+        } catch (error) {
+          addSystemChat(clientId, `couldn't load YouTube video (${(error as Error).message})`);
+        }
+        return;
       }
-      return;
+      setHost(url, clientId);
+    } finally {
+      ack?.();
     }
-    setHost(url, clientId);
   });
 
   socket.on("CMD:play", () => {
@@ -512,29 +555,59 @@ io.on("connection", (socket: Socket) => {
     io.emit("chatinit", state.chat);
   });
 
-  socket.on("CMD:playlistAdd", async (raw: unknown) => {
-    const url = String(raw ?? "");
-    let item: PlaylistItem | null;
-    const ytId = parseYouTubeId(url);
-    if (ytId) {
-      try {
-        const resolved = await resolveYouTube(ytId);
-        item = { url: `${BASE_PATH}/api/yt/manifest?v=${ytId}`, name: resolved.title, duration: resolved.durationSec, type: "file" };
-      } catch (error) {
-        addSystemChat(clientId, `couldn't load YouTube video (${(error as Error).message})`);
+  socket.on("CMD:playlistAdd", async (raw: unknown, ack?: () => void) => {
+    try {
+      const url = String(raw ?? "");
+      let item: PlaylistItem | null;
+      const playlistId = parseYouTubePlaylistId(url);
+      if (playlistId) {
+        try {
+          const items = await resolveYouTubePlaylist(playlistId);
+          if (items.length === 0) {
+            addSystemChat(clientId, "couldn't queue YouTube playlist (no playable videos found)");
+            return;
+          }
+          state.playlist.push(...items);
+          io.emit("playlist", state.playlist);
+          addSystemChat(clientId, `added playlist to queue: ${items.length} videos`);
+          if (!state.video) {
+            playlistNext(clientId);
+          }
+        } catch (error) {
+          addSystemChat(clientId, `couldn't queue YouTube playlist (${(error as Error).message})`);
+        }
         return;
       }
-    } else {
-      item = makePlaylistItem(url);
-    }
-    if (!item) {
-      return;
-    }
-    state.playlist.push(item);
-    io.emit("playlist", state.playlist);
-    addSystemChat(clientId, `added to playlist: ${item.name}`);
-    if (!state.video) {
-      playlistNext(clientId);
+      const yt = parseYouTubeUrl(url);
+      if (yt) {
+        try {
+          const resolved = await resolveYouTube(yt.id);
+          const startParam = yt.startSeconds > 0 ? `&start=${yt.startSeconds}` : "";
+          const nameSuffix = yt.startSeconds > 0 ? ` @ ${formatTimestamp(yt.startSeconds)}` : "";
+          item = {
+            url: `${BASE_PATH}/api/yt/manifest?v=${yt.id}${startParam}`,
+            name: `${resolved.title}${nameSuffix}`,
+            duration: resolved.durationSec,
+            type: "file",
+          };
+        } catch (error) {
+          addSystemChat(clientId, `couldn't load YouTube video (${(error as Error).message})`);
+          return;
+        }
+      } else {
+        item = makePlaylistItem(url);
+      }
+      if (!item) {
+        return;
+      }
+      state.playlist.push(item);
+      io.emit("playlist", state.playlist);
+      addSystemChat(clientId, `added to playlist: ${item.name}`);
+      if (!state.video) {
+        playlistNext(clientId);
+      }
+    } finally {
+      ack?.();
     }
   });
 
@@ -801,6 +874,7 @@ function getHostState(): HostState {
   return {
     video: state.video,
     videoTS: state.videoTS,
+    hostSeq: state.hostSeq,
     paused: state.paused,
     playbackRate: state.playbackRate,
     loop: state.loop,
@@ -849,7 +923,12 @@ async function getInnertube(): Promise<Innertube> {
   return innertube;
 }
 
-function parseYouTubeId(input: string): string | null {
+type ParsedYouTubeUrl = {
+  id: string;
+  startSeconds: number;
+};
+
+function parseYouTubeUrl(input: string): ParsedYouTubeUrl | null {
   let url: URL;
   try {
     url = new URL(input.trim());
@@ -858,19 +937,89 @@ function parseYouTubeId(input: string): string | null {
   }
   const host = url.hostname.replace(/^www\./, "").toLowerCase();
   const idLike = (value: string | null) => (value && /^[\w-]{11}$/.test(value) ? value : null);
+  let id: string | null = null;
   if (host === "youtu.be") {
-    return idLike(url.pathname.slice(1).split("/")[0]);
-  }
-  if (host === "youtube.com" || host === "m.youtube.com" || host === "music.youtube.com") {
+    id = idLike(url.pathname.slice(1).split("/")[0]);
+  } else if (host === "youtube.com" || host === "m.youtube.com" || host === "music.youtube.com") {
     if (url.pathname === "/watch") {
-      return idLike(url.searchParams.get("v"));
-    }
-    const parts = url.pathname.split("/").filter(Boolean);
-    if (parts[0] === "shorts" || parts[0] === "embed" || parts[0] === "v") {
-      return idLike(parts[1] ?? null);
+      id = idLike(url.searchParams.get("v"));
+    } else {
+      const parts = url.pathname.split("/").filter(Boolean);
+      if (parts[0] === "shorts" || parts[0] === "embed" || parts[0] === "v") {
+        id = idLike(parts[1] ?? null);
+      }
     }
   }
-  return null;
+  return id ? { id, startSeconds: parseYouTubeStartSeconds(url) } : null;
+}
+
+function parseYouTubeId(input: string): string | null {
+  return parseYouTubeUrl(input)?.id ?? null;
+}
+
+function parseYouTubePlaylistId(input: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(input.trim());
+  } catch {
+    return null;
+  }
+  const host = url.hostname.replace(/^www\./, "").toLowerCase();
+  if (host !== "youtube.com" && host !== "m.youtube.com" && host !== "music.youtube.com") {
+    return null;
+  }
+  const id = url.searchParams.get("list");
+  return id && /^[\w-]+$/.test(id) ? id : null;
+}
+
+function parseYouTubeStartSeconds(url: URL): number {
+  return parseTimeParam(url.searchParams.get("t") ?? url.searchParams.get("start"));
+}
+
+function parseTimeParam(value: string | null): number {
+  if (!value) {
+    return 0;
+  }
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) {
+    return 0;
+  }
+  if (/^\d+$/.test(normalized)) {
+    return clampTime(Number(normalized));
+  }
+  const match = /^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s?)?$/.exec(normalized);
+  if (!match || !match[0]) {
+    return 0;
+  }
+  const hours = Number(match[1] ?? 0);
+  const minutes = Number(match[2] ?? 0);
+  const seconds = Number(match[3] ?? 0);
+  return clampTime(hours * 3600 + minutes * 60 + seconds);
+}
+
+function parseInternalStartSeconds(input: string): number {
+  try {
+    const parsed = new URL(input, "http://watchy.local");
+    if (parsed.pathname !== `${BASE_PATH}/api/yt/manifest`) {
+      return 0;
+    }
+    return clampTime(Number(parsed.searchParams.get("start") ?? 0));
+  } catch {
+    return 0;
+  }
+}
+
+function parseInternalYouTubeId(input: string): string | null {
+  try {
+    const parsed = new URL(input, "http://watchy.local");
+    if (parsed.pathname !== `${BASE_PATH}/api/yt/manifest`) {
+      return null;
+    }
+    const id = parsed.searchParams.get("v") ?? "";
+    return /^[\w-]{11}$/.test(id) ? id : null;
+  } catch {
+    return null;
+  }
 }
 
 type YtDlpFormat = {
@@ -977,6 +1126,49 @@ async function resolveYouTube(id: string): Promise<YtResolved> {
   return resolved;
 }
 
+async function resolveYouTubePlaylist(id: string): Promise<PlaylistItem[]> {
+  let playlist = await getInnertube().then((yt) => yt.getPlaylist(id));
+  const items: PlaylistItem[] = [];
+  const seen = new Set<string>();
+  while (items.length < YT_PLAYLIST_MAX_ITEMS) {
+    for (const raw of playlist.items as any[]) {
+      const videoId = playlistVideoId(raw);
+      if (!videoId || seen.has(videoId)) {
+        continue;
+      }
+      seen.add(videoId);
+      items.push({
+        url: `${BASE_PATH}/api/yt/manifest?v=${videoId}`,
+        name: playlistVideoTitle(raw),
+        duration: playlistVideoDuration(raw),
+        type: "file",
+      });
+      if (items.length >= YT_PLAYLIST_MAX_ITEMS) {
+        break;
+      }
+    }
+    if (items.length >= YT_PLAYLIST_MAX_ITEMS || !playlist.has_continuation) {
+      break;
+    }
+    playlist = await playlist.getContinuation();
+  }
+  return items;
+}
+
+function playlistVideoId(item: any): string | null {
+  const id = item?.id ?? (item?.content_type === "VIDEO" ? item?.content_id : null);
+  return typeof id === "string" && /^[\w-]{11}$/.test(id) ? id : null;
+}
+
+function playlistVideoTitle(item: any): string {
+  return textValue(item?.title) || textValue(item?.metadata?.title) || "YouTube video";
+}
+
+function playlistVideoDuration(item: any): number {
+  const seconds = Number(item?.duration?.seconds ?? item?.length_seconds ?? 0);
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : 0;
+}
+
 async function proxyYouTubeSegment(
   id: string,
   itag: number,
@@ -1057,26 +1249,52 @@ function buildDashManifest(id: string, r: YtResolved): string {
 </MPD>`;
 }
 
-function setHost(url: string, clientId?: string, label?: string) {
+function setHost(url: string, clientId?: string, label?: string, startSeconds = 0) {
   const cleanUrl = url.trim().slice(0, 4000);
   if (cleanUrl && !isAllowedMediaUrl(cleanUrl)) {
     return;
   }
   const previousVideo = state.video;
+  const initialTime = cleanUrl ? clampTime(startSeconds || parseInternalStartSeconds(cleanUrl)) : 0;
   state.video = cleanUrl;
-  state.videoTS = 0;
+  state.videoTS = initialTime;
+  state.hostSeq += 1;
   state.paused = !cleanUrl;
   state.playbackRate = 1;
   state.loop = false;
   state.tsMap = {};
+  recordYouTubeHistory(cleanUrl, label);
+  if (DEBUG_YT_SEEK && initialTime > 0) {
+    console.info("[watchy:yt-seek] emit", { video: state.video, videoTS: state.videoTS, hostSeq: state.hostSeq });
+  }
   io.emit("REC:host", getHostState());
   io.emit("REC:tsMap", state.tsMap);
+  if (initialTime > 0) {
+    io.emit("REC:seek", initialTime);
+  }
   if (clientId && previousVideo !== cleanUrl) {
     addSystemChat(
       clientId,
       cleanUrl ? `switched video to: ${label || mediaNameFromUrl(cleanUrl)}` : "cleared the video",
     );
   }
+}
+
+function recordYouTubeHistory(url: string, label?: string) {
+  const id = parseInternalYouTubeId(url);
+  if (!id) {
+    return;
+  }
+  const title = label?.replace(/\s+@\s+\d{1,2}:\d{2}(?::\d{2})?$/, "").trim() || "YouTube video";
+  const item: YouTubeHistoryItem = {
+    kind: "video",
+    id,
+    title,
+    author: "",
+    duration: "",
+    thumbnail: `https://i.ytimg.com/vi/${id}/hqdefault.jpg`,
+  };
+  state.ytHistory = [item, ...state.ytHistory.filter((entry) => entry.id !== id)].slice(0, 40);
 }
 
 function playlistNext(clientId?: string) {
@@ -1119,11 +1337,53 @@ function isAllowedMediaUrl(url: string) {
 function mediaNameFromUrl(url: string) {
   try {
     const parsed = new URL(url);
-    const last = decodeURIComponent(parsed.pathname.split("/").filter(Boolean).at(-1) ?? url);
+    const parts = parsed.pathname.split("/").filter(Boolean);
+    const last = decodeURIComponent(parts[parts.length - 1] ?? url);
     return last || url;
   } catch {
     return url;
   }
+}
+
+function textValue(value: any): string {
+  if (!value) {
+    return "";
+  }
+  if (typeof value === "string") {
+    return value;
+  }
+  if (typeof value.text === "string") {
+    return value.text;
+  }
+  if (typeof value.simpleText === "string") {
+    return value.simpleText;
+  }
+  if (Array.isArray(value.runs)) {
+    return value.runs.map((run: any) => run?.text ?? "").join("");
+  }
+  if (Array.isArray(value)) {
+    return value.map(textValue).filter(Boolean).join(" ");
+  }
+  return "";
+}
+
+function thumbnailUrl(thumbnails: any): string {
+  return Array.isArray(thumbnails)
+    ? thumbnails[thumbnails.length - 1]?.url ?? thumbnails[0]?.url ?? ""
+    : "";
+}
+
+function youtubePlaylistResultId(result: any): string | null {
+  const id = result?.id ?? (result?.content_type === "PLAYLIST" ? result?.content_id : null);
+  return typeof id === "string" && /^[\w-]+$/.test(id) ? id : null;
+}
+
+function youtubeResultTitle(result: any): string {
+  return textValue(result?.title) || textValue(result?.metadata?.title) || "YouTube playlist";
+}
+
+function youtubeResultThumbnail(result: any): string {
+  return thumbnailUrl(result?.thumbnails) || thumbnailUrl(result?.content_image?.image?.thumbnails);
 }
 
 function addChat(message: ChatMessage) {
