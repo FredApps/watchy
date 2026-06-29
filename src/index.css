@@ -363,10 +363,17 @@ h1 {
 }
 
 .controls {
-  display: grid;
-  grid-template-columns: repeat(3, auto) auto minmax(120px, 1fr) auto auto auto auto minmax(80px, 120px) auto;
+  display: flex;
+  flex-wrap: nowrap;
   align-items: center;
   gap: 8px;
+  overflow: hidden;
+}
+
+.controls > button,
+.controls > select,
+.controls > .time {
+  flex: 0 0 auto;
 }
 
 .theater-button {
@@ -393,12 +400,18 @@ h1 {
 
 .timeline-wrap {
   position: relative;
-  width: 100%;
-  min-width: 0;
+  flex: 1 1 120px;
+  min-width: 44px;
 }
 
 .timeline {
   width: 100%;
+}
+
+.volume-slider {
+  flex: 0 1 120px;
+  width: 120px;
+  min-width: 36px;
 }
 
 .timeline-tooltip {
@@ -1299,7 +1312,6 @@ h1 {
   }
 
   .controls {
-    grid-template-columns: repeat(3, auto) auto minmax(180px, 1fr) auto auto auto;
     gap: 6px;
   }
 
@@ -1363,26 +1375,26 @@ h1 {
   }
 
   .controls {
-    grid-template-columns: repeat(4, minmax(0, 1fr));
     gap: 6px;
+    font-size: 14px;
   }
 
   .controls .time {
     align-self: center;
-    justify-self: center;
   }
 
   .timeline-wrap {
-    grid-column: 2 / 4;
+    flex-basis: 72px;
+    min-width: 34px;
   }
 
   .controls select,
   .controls input[type="range"]:not(.timeline) {
-    width: 100%;
+    width: 64px;
   }
 
   .theater-button {
-    grid-column: span 2;
+    min-width: 0;
   }
 
   .video {

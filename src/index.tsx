@@ -16,6 +16,7 @@ type MediaDirectory = {
   type: "directory";
   name: string;
   path: string;
+  children?: MediaEntry[];
 };
 
 type MediaEntry = PlaylistItem | MediaDirectory;
@@ -631,7 +632,13 @@ function WatchRoom() {
           controller ? { signal: controller.signal } : undefined,
         );
         if (response.ok) {
-          setMediaResults(await response.json());
+          const entries = (await response.json()) as MediaEntry[];
+          setMediaResults(entries);
+          if (mediaQuery.trim()) {
+            setExpandedFolders(expandedFoldersFromSearch(entries));
+          } else {
+            setExpandedFolders({});
+          }
         }
       } finally {
         setMediaLoading(false);
@@ -1247,7 +1254,15 @@ function WatchRoom() {
             <button type="button" onClick={() => setMuted((prev) => !prev)}>
               {muted ? "Unmute" : "Mute"}
             </button>
-            <input type="range" min={0} max={1} step={0.01} value={volume} onChange={(event) => setVolume(Number(event.target.value))} />
+            <input
+              className="volume-slider"
+              type="range"
+              min={0}
+              max={1}
+              step={0.01}
+              value={volume}
+              onChange={(event) => setVolume(Number(event.target.value))}
+            />
             {isTheater && (
               <button type="button" onClick={() => setCleanTheater(true)}>
                 Fullscreen
@@ -1964,6 +1979,21 @@ function getOrCreateClientId() {
 function mediaDisplayName(name: string) {
   const parts = name.split("/");
   return parts[parts.length - 1] || name;
+}
+
+function expandedFoldersFromSearch(entries: MediaEntry[]) {
+  const expanded: Record<string, MediaEntry[] | undefined> = {};
+  const visit = (items: MediaEntry[]) => {
+    for (const item of items) {
+      if (item.type !== "directory" || !item.children) {
+        continue;
+      }
+      expanded[item.path] = item.children;
+      visit(item.children);
+    }
+  };
+  visit(entries);
+  return expanded;
 }
 
 function createClientId() {

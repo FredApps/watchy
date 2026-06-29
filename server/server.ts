@@ -131,6 +131,7 @@ type MediaDirectory = {
   type: "directory";
   name: string;
   path: string;
+  children?: MediaEntry[];
 };
 
 type MediaEntry = PlaylistItem | MediaDirectory;
@@ -142,6 +143,17 @@ type SortableMediaEntry = MediaEntry & {
 type SortablePlaylistItem = PlaylistItem & {
   modifiedMs: number;
 };
+
+type SearchMediaDirectory = MediaDirectory & {
+  children: SearchMediaEntry[];
+  modifiedMs: number;
+};
+
+type SearchMediaFile = PlaylistItem & {
+  modifiedMs: number;
+};
+
+type SearchMediaEntry = SearchMediaDirectory | SearchMediaFile;
 
 type ChatMessage = {
   id: string;
@@ -789,13 +801,11 @@ async function listMediaDirectory(root: string, relativeDir: string): Promise<Me
   return out.sort(sortMediaEntries).map(stripModifiedMs);
 }
 
-async function searchMediaFiles(root: string, query: string): Promise<PlaylistItem[]> {
+async function searchMediaFiles(root: string, query: string): Promise<MediaEntry[]> {
   const rootReal = await fs.realpath(root);
-  const out: SortablePlaylistItem[] = [];
+  const out: SearchMediaFile[] = [];
   await walk(rootReal);
-  return out
-    .sort((a, b) => b.modifiedMs - a.modifiedMs || a.name.localeCompare(b.name))
-    .map(stripPlaylistModifiedMs);
+  return buildSearchMediaTree(out);
 
   async function walk(dir: string) {
     const entries = await fs.readdir(dir, { withFileTypes: true });
@@ -820,6 +830,48 @@ async function searchMediaFiles(root: string, query: string): Promise<PlaylistIt
       out.push({ ...makeMediaFile(relative), modifiedMs: stats.mtimeMs });
     }
   }
+}
+
+function buildSearchMediaTree(files: SearchMediaFile[]): MediaEntry[] {
+  const roots: SearchMediaEntry[] = [];
+  const directories = new Map<string, SearchMediaDirectory>();
+
+  for (const file of files) {
+    const parts = file.name.split("/");
+    let siblings = roots;
+    let currentPath = "";
+    for (const part of parts.slice(0, -1)) {
+      currentPath = currentPath ? `${currentPath}/${part}` : part;
+      let directory = directories.get(currentPath);
+      if (!directory) {
+        directory = {
+          type: "directory",
+          name: part,
+          path: currentPath,
+          children: [],
+          modifiedMs: file.modifiedMs,
+        };
+        directories.set(currentPath, directory);
+        siblings.push(directory);
+      } else {
+        directory.modifiedMs = Math.max(directory.modifiedMs, file.modifiedMs);
+      }
+      siblings = directory.children;
+    }
+    siblings.push(file);
+  }
+
+  return sortAndStripSearchEntries(roots);
+}
+
+function sortAndStripSearchEntries(entries: SearchMediaEntry[]): MediaEntry[] {
+  return entries.sort(sortMediaEntries).map((entry) => {
+    if (entry.type === "directory") {
+      const { modifiedMs: _modifiedMs, children, ...directory } = entry;
+      return { ...directory, children: sortAndStripSearchEntries(children) };
+    }
+    return stripPlaylistModifiedMs(entry);
+  });
 }
 
 function sortMediaEntries(a: SortableMediaEntry, b: SortableMediaEntry) {
