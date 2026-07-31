@@ -921,9 +921,9 @@ h1 {
   height: 100vh;
   height: 100dvh;
   min-height: 0;
-  grid-template-rows: auto auto minmax(240px, 1fr);
+  grid-template-rows: auto auto auto minmax(240px, 1fr);
   gap: 10px;
-  overflow: hidden;
+  overflow: visible;
   border-left: 1px solid #262d31;
   padding: 12px;
   background: #181b1e;
