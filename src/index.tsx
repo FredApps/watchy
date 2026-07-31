@@ -5,6 +5,7 @@ import { createRoot } from "react-dom/client";
 import { io, type Socket } from "socket.io-client";
 import { chatEmojiCategories, chatEmojiSearchText, chatEmojiShortcodes } from "./emojiData";
 import { chatEmoticons } from "./emoticons";
+import { joypixelsShortcodes } from "./joypixelsShortcodes";
 import { CallPanel } from "./call";
 
 type PlaylistItem = {
@@ -75,19 +76,31 @@ const defaultChatWidth = 266;
 const debugYouTubeSeek = false;
 
 type EmojiSuggestion = { code: string; emoji: string };
-const shortcodeList = Object.keys(chatEmojiShortcodes).sort();
+// JoyPixels is the set Discord uses, so ":open_mouth:" works; the CLDR names
+// Watchy already shipped stay valid. Where the two disagree JoyPixels wins, so
+// a shortcode means here what it means in Discord.
+const chatShortcodes: Record<string, string> = { ...chatEmojiShortcodes, ...joypixelsShortcodes };
+// Shortest first, so ":smile" offers :smile: ahead of :smiling_face_with_tear:.
+const shortcodeList = Object.keys(chatShortcodes).sort((a, b) => a.length - b.length || a.localeCompare(b));
 function lookupEmojiSuggestions(query: string, limit = 8): EmojiSuggestion[] {
   const q = query.toLowerCase();
   const starts: string[] = [];
   const contains: string[] = [];
+  const seen = new Set<string>();
   for (const code of shortcodeList) {
+    const emoji = chatShortcodes[code];
+    if (seen.has(emoji)) {
+      continue;
+    }
     if (code.startsWith(q)) {
+      seen.add(emoji);
       starts.push(code);
     } else if (code.includes(q)) {
+      seen.add(emoji);
       contains.push(code);
     }
   }
-  return [...starts, ...contains].slice(0, limit).map((code) => ({ code, emoji: chatEmojiShortcodes[code] }));
+  return [...starts, ...contains].slice(0, limit).map((code) => ({ code, emoji: chatShortcodes[code] }));
 }
 
 // Longest first so ":-)" wins over ":-" and "</3" over "<3".
@@ -100,7 +113,7 @@ const emojiAliases: Record<string, string> = {};
 for (const [code, emoji] of Object.entries(chatEmoticons)) {
   emojiAliases[emoji] = `${emojiAliases[emoji] ?? ""} ${code}`;
 }
-for (const [code, emoji] of Object.entries(chatEmojiShortcodes)) {
+for (const [code, emoji] of Object.entries(chatShortcodes)) {
   emojiAliases[emoji] = `${emojiAliases[emoji] ?? ""} :${code}:`;
 }
 const emojiValues = [
@@ -2001,7 +2014,7 @@ function renderMarkdownLine(input: string, keyPrefix: string): React.ReactNode[]
     } else if (italicStar || italicUnderscore) {
       nodes.push(<em key={key}>{inner(italicStar || italicUnderscore)}</em>);
     } else if (shortcode) {
-      const emoji = chatEmojiShortcodes[shortcode.toLowerCase()];
+      const emoji = chatShortcodes[shortcode.toLowerCase()];
       nodes.push(emoji ?? raw);
     } else if (emoticon) {
       const emoji = chatEmoticons[emoticon.toLowerCase()];
