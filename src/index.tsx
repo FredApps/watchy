@@ -4,6 +4,7 @@ import React, { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { io, type Socket } from "socket.io-client";
 import { chatEmojiCategories, chatEmojiSearchText, chatEmojiShortcodes } from "./emojiData";
+import { chatEmoticons } from "./emoticons";
 import { CallPanel } from "./call";
 
 type PlaylistItem = {
@@ -87,6 +88,20 @@ function lookupEmojiSuggestions(query: string, limit = 8): EmojiSuggestion[] {
     }
   }
   return [...starts, ...contains].slice(0, limit).map((code) => ({ code, emoji: chatEmojiShortcodes[code] }));
+}
+
+// Longest first so ":-)" wins over ":-" and "</3" over "<3".
+const emoticonPattern = Object.keys(chatEmoticons)
+  .sort((a, b) => b.length - a.length)
+  .map((code) => code.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+  .join("|");
+// Every alias that should find an emoji in the picker search, keyed by emoji.
+const emojiAliases: Record<string, string> = {};
+for (const [code, emoji] of Object.entries(chatEmoticons)) {
+  emojiAliases[emoji] = `${emojiAliases[emoji] ?? ""} ${code}`;
+}
+for (const [code, emoji] of Object.entries(chatEmojiShortcodes)) {
+  emojiAliases[emoji] = `${emojiAliases[emoji] ?? ""} :${code}:`;
 }
 const emojiValues = [
   "\u{1F600}",
@@ -316,7 +331,9 @@ function WatchRoom() {
       if (!query) {
         return true;
       }
-      return `${value} ${chatEmojiSearchText[value] ?? ""}`.toLowerCase().includes(query);
+      const haystack = `${value} ${chatEmojiSearchText[value] ?? ""}${emojiAliases[value] ?? ""}`.toLowerCase();
+      // ":O" should find the emoticon; ":open" should still find it by name.
+      return haystack.includes(query) || haystack.includes(query.replace(/^:+|:+$/g, ""));
     });
   }, [emojiCategory, emojiSearch]);
 
@@ -1909,8 +1926,9 @@ function renderMarkdownLine(input: string, keyPrefix: string): React.ReactNode[]
       "\\*([\\s\\S]+?)\\*", // *italic*
       "_([\\s\\S]+?)_", // _italic_
       ":([a-zA-Z0-9_+-]+):", // :shortcode:
+      `(^|\\s)(${emoticonPattern})(?=\\s|$)`, // :) and friends, standalone only
     ].join("|"),
-    "g",
+    "gi",
   );
   let cursor = 0;
   let match: RegExpExecArray | null;
@@ -1932,6 +1950,8 @@ function renderMarkdownLine(input: string, keyPrefix: string): React.ReactNode[]
       italicStar,
       italicUnderscore,
       shortcode,
+      emoticonLead,
+      emoticon,
     ] = match;
     const key = `${keyPrefix}-${match.index}`;
     const inner = (text: string) => renderMarkdownLine(text, key);
@@ -1983,6 +2003,9 @@ function renderMarkdownLine(input: string, keyPrefix: string): React.ReactNode[]
     } else if (shortcode) {
       const emoji = chatEmojiShortcodes[shortcode.toLowerCase()];
       nodes.push(emoji ?? raw);
+    } else if (emoticon) {
+      const emoji = chatEmoticons[emoticon.toLowerCase()];
+      nodes.push(emoji ? `${emoticonLead}${emoji}` : raw);
     }
     cursor = match.index + raw.length;
   }
