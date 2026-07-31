@@ -257,6 +257,7 @@ function WatchRoom() {
   const [mediaQuery, setMediaQuery] = useState("");
   const [mediaResults, setMediaResults] = useState<MediaEntry[]>([]);
   const [expandedFolders, setExpandedFolders] = useState<Record<string, MediaEntry[] | undefined>>({});
+  const [mediaRootOpen, setMediaRootOpen] = useState(true);
   const [mediaLoading, setMediaLoading] = useState(false);
   const [ytQuery, setYtQuery] = useState("");
   const [ytResults, setYtResults] = useState<YouTubeResult[]>([]);
@@ -286,6 +287,7 @@ function WatchRoom() {
   const watchColumnRef = useRef<HTMLElement | null>(null);
   const controlsRef = useRef<HTMLDivElement | null>(null);
   const reactionRowRef = useRef<HTMLDivElement | null>(null);
+  const localMediaPanelRef = useRef<HTMLElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const messagesRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
@@ -577,6 +579,39 @@ function WatchRoom() {
   }, [host.video, videoAspectRatio]);
 
   useEffect(() => {
+    const panel = localMediaPanelRef.current;
+    if (!panel || !mediaRootOpen) {
+      return;
+    }
+
+    let frame = 0;
+    const viewport = window.visualViewport;
+    const updateHeight = () => {
+      window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(() => {
+        const viewportBottom = viewport ? viewport.offsetTop + viewport.height : window.innerHeight;
+        const panelTop = panel.getBoundingClientRect().top;
+        const availableHeight = Math.max(120, Math.min(680, Math.floor(viewportBottom - panelTop - 12)));
+        panel.style.setProperty("--local-media-height", `${availableHeight}px`);
+      });
+    };
+
+    updateHeight();
+    window.addEventListener("resize", updateHeight);
+    window.addEventListener("scroll", updateHeight, { passive: true });
+    viewport?.addEventListener("resize", updateHeight);
+    viewport?.addEventListener("scroll", updateHeight);
+
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener("resize", updateHeight);
+      window.removeEventListener("scroll", updateHeight);
+      viewport?.removeEventListener("resize", updateHeight);
+      viewport?.removeEventListener("scroll", updateHeight);
+    };
+  }, [host.video, mediaRootOpen, playlistOpen, ytLoading, ytOpen, ytResults.length]);
+
+  useEffect(() => {
     const updateTheaterState = () => {
       const active = isFullscreenActive();
       setIsTheater(active);
@@ -639,6 +674,7 @@ function WatchRoom() {
           } else {
             setExpandedFolders({});
           }
+          setMediaRootOpen(true);
         }
       } finally {
         setMediaLoading(false);
@@ -895,8 +931,8 @@ function WatchRoom() {
     }
   }
 
-  function seek(value: number) {
-    socket?.emit("CMD:seek", value);
+  function seek(value: number, silent = false) {
+    socket?.emit("CMD:seek", { time: value, silent });
   }
 
   useEffect(() => {
@@ -1234,7 +1270,9 @@ function WatchRoom() {
                 max={Number.isFinite(duration) && duration > 0 ? duration : Math.max(currentTime, leaderTime, 1)}
                 step={0.1}
                 value={Math.min(currentTime, Number.isFinite(duration) && duration > 0 ? duration : Math.max(currentTime, 1))}
-                onChange={(event) => seek(Number(event.target.value))}
+                onChange={(event) => seek(Number(event.target.value), true)}
+                onPointerUp={(event) => seek(Number((event.target as HTMLInputElement).value))}
+                onKeyUp={(event) => seek(Number((event.target as HTMLInputElement).value))}
                 onPointerEnter={updateTimelineHover}
                 onPointerMove={updateTimelineHover}
                 onPointerLeave={() => setTimelineHover(null)}
@@ -1261,6 +1299,7 @@ function WatchRoom() {
               max={1}
               step={0.01}
               value={volume}
+              style={{ "--fill": volume } as React.CSSProperties}
               onChange={(event) => setVolume(Number(event.target.value))}
             />
             {isTheater && (
@@ -1366,27 +1405,41 @@ function WatchRoom() {
             </>
           )}
           </section>
-          <section className="local-media-panel">
+          <section
+            className={`local-media-panel ${mediaRootOpen ? "open" : "collapsed"}`}
+            ref={localMediaPanelRef}
+          >
             <div className="section-title">Local media</div>
             <input
               value={mediaQuery}
               onChange={(event) => setMediaQuery(event.target.value)}
               placeholder="Search local media"
             />
-            <div className="media-list">
-              {mediaLoading && <div className="muted">Searching...</div>}
-              {mediaResults.map((item) => (
-                <MediaEntryRow
-                  key={item.type === "directory" ? item.path : item.url}
-                  item={item}
-                  level={0}
-                  expandedFolders={expandedFolders}
-                  toggleFolder={toggleFolder}
-                  playUrl={playUrl}
-                  addToPlaylist={addToPlaylist}
-                />
-              ))}
-            </div>
+            <button
+              type="button"
+              className="media-folder media-root-folder"
+              onClick={() => setMediaRootOpen((open) => !open)}
+              aria-expanded={mediaRootOpen}
+            >
+              <span className="folder-caret">{mediaRootOpen ? "\u25be" : "\u25b8"}</span>
+              <span title="C:\\inetpub\\wwwroot\\g">{mediaQuery.trim() ? "Search results" : "g"}</span>
+            </button>
+            {mediaRootOpen && (
+              <div className="media-list">
+                {mediaLoading && <div className="muted media-root-child">Searching...</div>}
+                {mediaResults.map((item) => (
+                  <MediaEntryRow
+                    key={item.type === "directory" ? item.path : item.url}
+                    item={item}
+                    level={1}
+                    expandedFolders={expandedFolders}
+                    toggleFolder={toggleFolder}
+                    playUrl={playUrl}
+                    addToPlaylist={addToPlaylist}
+                  />
+                ))}
+              </div>
+            )}
           </section>
         </section>
       </section>

@@ -21,12 +21,13 @@ try {
 const PORT = Number(process.env.PORT ?? 3090);
 const HOST = process.env.HOST ?? "127.0.0.1";
 const BASE_PATH = normalizeBase(process.env.BASE_PATH ?? "/watchy");
-const PASSWORD = process.env.WATCHY_PASSWORD ?? "change-me";
+const PASSWORDS = new Set(parsePasswordList(process.env.WATCHY_PASSWORDS ?? process.env.WATCHY_PASSWORD ?? "change-me"));
+const PRIMARY_PASSWORD = [...PASSWORDS][0] ?? "change-me";
 const COOKIE_NAME = "watchy_auth";
 const COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 365 * 10;
 const COOKIE_SECRET =
   process.env.WATCHY_COOKIE_SECRET ??
-  crypto.createHash("sha256").update(`watchy:${PASSWORD}`).digest("hex");
+  crypto.createHash("sha256").update(`watchy:${PRIMARY_PASSWORD}`).digest("hex");
 const MEDIA_ROOT = path.resolve(process.env.WATCHY_MEDIA_ROOT ?? path.join(process.cwd(), "media"));
 const MEDIA_BASE_URL = process.env.WATCHY_MEDIA_BASE_URL ?? `${BASE_PATH}/media`;
 const BUILD_DIR = path.resolve(import.meta.dirname, "../build");
@@ -224,7 +225,7 @@ app.use(compression());
 
 app.get("/", (_req, res) => res.redirect(BASE_PATH));
 app.post(`${BASE_PATH}/api/login`, (req, res) => {
-  if (String(req.body?.password ?? "") !== PASSWORD) {
+  if (!PASSWORDS.has(String(req.body?.password ?? ""))) {
     res.status(401).json({ ok: false });
     return;
   }
@@ -460,12 +461,16 @@ io.on("connection", (socket: Socket) => {
   });
 
   socket.on("CMD:seek", (raw: unknown) => {
-    const time = clampTime(Number(raw));
+    const payload = raw && typeof raw === "object" ? (raw as { time?: unknown; silent?: unknown }) : { time: raw };
+    const time = clampTime(Number(payload.time));
+    const silent = payload.silent === true;
     state.videoTS = time;
     state.tsMap = {};
     io.emit("REC:tsMap", state.tsMap);
     io.emit("REC:seek", time);
-    addSystemChat(clientId, `jumped to ${formatTimestamp(time)}`);
+    if (!silent) {
+      addSystemChat(clientId, `jumped to ${formatTimestamp(time)}`);
+    }
     io.emit("REC:host", getHostState());
   });
 
@@ -770,6 +775,13 @@ function parseCookies(header: string | undefined) {
     }
   }
   return cookies;
+}
+
+function parsePasswordList(value: string) {
+  return value
+    .split(",")
+    .map((password) => password.trim())
+    .filter(Boolean);
 }
 
 async function listMediaDirectory(root: string, relativeDir: string): Promise<MediaEntry[]> {

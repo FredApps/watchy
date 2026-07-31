@@ -412,6 +412,60 @@ h1 {
   flex: 0 1 120px;
   width: 120px;
   min-width: 36px;
+  -webkit-appearance: none;
+  appearance: none;
+  height: 18px;
+  margin: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.volume-slider::-webkit-slider-runnable-track {
+  height: 6px;
+  border-radius: 999px;
+  background: linear-gradient(
+    to right,
+    #4f8ef7 0%,
+    #4f8ef7 calc(var(--fill, 0) * 100%),
+    #3d474d calc(var(--fill, 0) * 100%),
+    #3d474d 100%
+  );
+}
+
+.volume-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  margin-top: -3px;
+  border: 0;
+  border-radius: 50%;
+  background: #f5f7f8;
+}
+
+.volume-slider::-moz-range-track {
+  height: 6px;
+  border-radius: 999px;
+  background: linear-gradient(
+    to right,
+    #4f8ef7 0%,
+    #4f8ef7 calc(var(--fill, 0) * 100%),
+    #3d474d calc(var(--fill, 0) * 100%),
+    #3d474d 100%
+  );
+}
+
+.volume-slider::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border: 0;
+  border-radius: 50%;
+  background: #f5f7f8;
+}
+
+.volume-slider:focus-visible {
+  outline: 2px solid #4f8ef7;
+  outline-offset: 2px;
 }
 
 .timeline-tooltip {
@@ -466,8 +520,8 @@ h1 {
   grid-auto-rows: auto;
   grid-template-rows: none;
   gap: 8px;
-  min-height: clamp(560px, 68vh, 880px);
-  overflow: hidden;
+  min-height: 0;
+  overflow: visible;
 }
 
 .youtube-panel,
@@ -487,7 +541,15 @@ h1 {
 }
 
 .local-media-panel {
-  grid-template-rows: auto auto minmax(320px, 1fr);
+  height: var(--local-media-height, min(680px, calc(100dvh - 24px)));
+  min-height: 0;
+  grid-template-rows: auto auto auto minmax(0, 1fr);
+}
+
+.local-media-panel.collapsed {
+  height: auto;
+  min-height: 0;
+  grid-template-rows: auto auto auto;
 }
 
 .section-title-row {
@@ -507,7 +569,9 @@ h1 {
   display: grid;
   align-content: start;
   gap: 6px;
+  min-height: 0;
   overflow: auto;
+  overscroll-behavior: contain;
 }
 
 .media-item {
@@ -595,6 +659,15 @@ h1 {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.media-root-folder {
+  border-color: #42515b;
+  background: #1a2126;
+}
+
+.media-root-child {
+  padding-left: 26px;
 }
 
 .folder-caret {
@@ -1327,7 +1400,7 @@ h1 {
   }
 
   .local-media-panel {
-    grid-template-rows: auto auto minmax(260px, 56vh);
+    height: var(--local-media-height, min(620px, calc(100dvh - 16px)));
   }
 
   .yt-item {
@@ -1425,7 +1498,7 @@ h1 {
   }
 
   .local-media-panel {
-    grid-template-rows: auto auto minmax(300px, 60vh);
+    height: var(--local-media-height, min(560px, calc(100dvh - 16px)));
   }
 
   .yt-item {
