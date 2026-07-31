@@ -267,6 +267,7 @@ function WatchRoom() {
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [timelineHover, setTimelineHover] = useState<{ x: number; time: number } | null>(null);
+  const [scrubTime, setScrubTime] = useState<number | null>(null);
   const [videoAspectRatio, setVideoAspectRatio] = useState(16 / 9);
   const [stageSize, setStageSize] = useState<{ width?: number; height?: number }>({});
   const [resumeBlocked, setResumeBlocked] = useState(false);
@@ -1004,6 +1005,15 @@ function WatchRoom() {
     setTimelineHover({ x: ratio * 100, time: ratio * maxTime });
   }
 
+  const timelineMax = Number.isFinite(duration) && duration > 0 ? duration : Math.max(currentTime, leaderTime, 1);
+  const timelineValue = Math.max(0, Math.min(scrubTime ?? currentTime, timelineMax));
+
+  function commitScrub(event: React.SyntheticEvent<HTMLInputElement>) {
+    const value = Number(event.currentTarget.value);
+    setScrubTime(null);
+    seek(value);
+  }
+
   function skipNext() {
     socket?.emit("CMD:playlistNext");
   }
@@ -1256,7 +1266,7 @@ function WatchRoom() {
             <button type="button" onClick={skipNext} disabled={!playlist.length}>
               Next
             </button>
-            <span className="time">{formatTimestamp(currentTime)}</span>
+            <span className="time">{formatTimestamp(scrubTime ?? currentTime)}</span>
             <div className="timeline-wrap">
               {timelineHover && (
                 <div className="timeline-tooltip" style={{ left: `${timelineHover.x}%` }}>
@@ -1267,12 +1277,18 @@ function WatchRoom() {
                 className="timeline"
                 type="range"
                 min={0}
-                max={Number.isFinite(duration) && duration > 0 ? duration : Math.max(currentTime, leaderTime, 1)}
+                max={timelineMax}
                 step={0.1}
-                value={Math.min(currentTime, Number.isFinite(duration) && duration > 0 ? duration : Math.max(currentTime, 1))}
-                onChange={(event) => seek(Number(event.target.value), true)}
-                onPointerUp={(event) => seek(Number((event.target as HTMLInputElement).value))}
-                onKeyUp={(event) => seek(Number((event.target as HTMLInputElement).value))}
+                value={timelineValue}
+                style={{ "--fill": timelineMax > 0 ? timelineValue / timelineMax : 0 } as React.CSSProperties}
+                onChange={(event) => setScrubTime(Number(event.target.value))}
+                onPointerUp={commitScrub}
+                onKeyUp={commitScrub}
+                onBlur={(event) => {
+                  if (scrubTime !== null) {
+                    commitScrub(event);
+                  }
+                }}
                 onPointerEnter={updateTimelineHover}
                 onPointerMove={updateTimelineHover}
                 onPointerLeave={() => setTimelineHover(null)}
