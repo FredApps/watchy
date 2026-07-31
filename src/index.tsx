@@ -4,6 +4,7 @@ import React, { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { io, type Socket } from "socket.io-client";
 import { chatEmojiCategories, chatEmojiSearchText, chatEmojiShortcodes } from "./emojiData";
+import { CallPanel } from "./call";
 
 type PlaylistItem = {
   url: string;
@@ -267,6 +268,7 @@ function WatchRoom() {
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [timelineHover, setTimelineHover] = useState<{ x: number; time: number } | null>(null);
+  const [callControlsTarget, setCallControlsTarget] = useState<HTMLDivElement | null>(null);
   const [scrubTime, setScrubTime] = useState<number | null>(null);
   const [videoAspectRatio, setVideoAspectRatio] = useState(16 / 9);
   const [stageSize, setStageSize] = useState<{ width?: number; height?: number }>({});
@@ -1323,9 +1325,12 @@ function WatchRoom() {
                 Fullscreen
               </button>
             )}
-            <button type="button" className="theater-button" onClick={toggleTheater}>
-              {isTheater ? "Exit" : "Theater"}
-            </button>
+            <div className="theater-call-controls">
+              <button type="button" className="theater-button" onClick={toggleTheater}>
+                {isTheater ? "Exit" : "Theater"}
+              </button>
+              <div className="call-controls-slot" ref={setCallControlsTarget} />
+            </div>
           </div>
         )}
 
@@ -1477,6 +1482,14 @@ function WatchRoom() {
         >
           {chatOpen ? "\u203A" : "\u2039"}
         </button>
+
+        <CallPanel
+          socket={socket}
+          clientId={clientId}
+          nameMap={nameMap}
+          colorMap={colorMap}
+          controlsTarget={callControlsTarget}
+        />
 
         {chatOpen && (
           <>

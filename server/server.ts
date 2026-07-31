@@ -176,6 +176,24 @@ type User = {
   name: string;
 };
 
+type CallParticipant = {
+  id: string;
+  audio: boolean;
+  video: boolean;
+};
+
+type RtcDescription = {
+  type: "offer" | "answer";
+  sdp: string;
+};
+
+type RtcCandidate = {
+  candidate: string;
+  sdpMid: string | null;
+  sdpMLineIndex: number | null;
+  usernameFragment: string | null;
+};
+
 type HostState = {
   video: string;
   videoTS: number;
@@ -211,6 +229,8 @@ const state: WatchyState = {
   tsMap: {},
 };
 const socketByClientId = new Map<string, string>();
+const callByClientId = new Map<string, Omit<CallParticipant, "id">>();
+const MAX_CALL_PARTICIPANTS = 6;
 
 const app = express();
 const server = http.createServer(app);
@@ -392,6 +412,10 @@ io.on("connection", (socket: Socket) => {
     socket.emit("REC:play");
   }
   emitRoster();
+  // Everyone in the room is a call participant from the moment they connect,
+  // receive-only until they switch their own camera or microphone on.
+  callByClientId.set(clientId, callByClientId.get(clientId) ?? { audio: false, video: false });
+  emitCallParticipants();
 
   socket.on("CMD:name", (raw: unknown) => {
     const name = String(raw ?? "").trim().slice(0, 40) || "Guest";
@@ -667,12 +691,53 @@ io.on("connection", (socket: Socket) => {
     });
   });
 
+  socket.on("CMD:callState", (raw: unknown) => {
+    const requested = sanitizeCallState(raw);
+    const publishers = Array.from(callByClientId).filter(
+      ([id, media]) => id !== clientId && (media.audio || media.video),
+    ).length;
+    // Receiving is always allowed; only publishing is capped, because a mesh
+    // costs every sender one upload stream per other participant.
+    const allowed =
+      (requested.audio || requested.video) && publishers >= MAX_CALL_PARTICIPANTS
+        ? { audio: false, video: false }
+        : requested;
+    callByClientId.set(clientId, allowed);
+    emitCallParticipants();
+  });
+
+  socket.on("CMD:callSync", () => {
+    socket.emit("REC:callParticipants", getCallParticipants());
+  });
+
+  socket.on("CMD:rtcSignal", (raw: unknown) => {
+    if (!callByClientId.has(clientId)) {
+      return;
+    }
+    const signal = sanitizeRtcSignal(raw);
+    if (!signal || signal.targetId === clientId || !callByClientId.has(signal.targetId)) {
+      return;
+    }
+    const targetSocketId = socketByClientId.get(signal.targetId);
+    const targetSocket = targetSocketId ? io.sockets.sockets.get(targetSocketId) : undefined;
+    if (!targetSocket?.connected) {
+      return;
+    }
+    targetSocket.emit("REC:rtcSignal", {
+      fromId: clientId,
+      description: signal.description,
+      candidate: signal.candidate,
+    });
+  });
+
   socket.on("disconnect", () => {
     if (socketByClientId.get(clientId) === socket.id) {
       socketByClientId.delete(clientId);
       delete state.tsMap[clientId];
+      callByClientId.delete(clientId);
       syncRoster();
       emitRoster();
+      emitCallParticipants();
       io.emit("REC:tsMap", state.tsMap);
     }
   });
@@ -1467,6 +1532,80 @@ function addSystemChat(clientId: string, msg: string) {
   });
 }
 
+function getCallParticipants(): CallParticipant[] {
+  return Array.from(callByClientId, ([id, media]) => ({ id, ...media })).sort((a, b) =>
+    a.id.localeCompare(b.id),
+  );
+}
+
+function emitCallParticipants() {
+  io.emit("REC:callParticipants", getCallParticipants());
+}
+
+function sanitizeCallState(raw: unknown): Omit<CallParticipant, "id"> {
+  const value = raw && typeof raw === "object" ? (raw as { audio?: unknown; video?: unknown }) : {};
+  return {
+    audio: value.audio === true,
+    video: value.video === true,
+  };
+}
+
+function sanitizeRtcSignal(raw: unknown): {
+  targetId: string;
+  description?: RtcDescription;
+  candidate?: RtcCandidate;
+} | null {
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+  const value = raw as { targetId?: unknown; description?: unknown; candidate?: unknown };
+  const targetId = String(value.targetId ?? "");
+  if (!/^[0-9a-f-]{36}$/i.test(targetId)) {
+    return null;
+  }
+
+  let description: RtcDescription | undefined;
+  if (value.description && typeof value.description === "object") {
+    const rawDescription = value.description as { type?: unknown; sdp?: unknown };
+    const type = String(rawDescription.type ?? "");
+    const sdp = String(rawDescription.sdp ?? "");
+    if ((type !== "offer" && type !== "answer") || !sdp || sdp.length > 100_000) {
+      return null;
+    }
+    description = { type, sdp };
+  }
+
+  let candidate: RtcCandidate | undefined;
+  if (value.candidate && typeof value.candidate === "object") {
+    const rawCandidate = value.candidate as {
+      candidate?: unknown;
+      sdpMid?: unknown;
+      sdpMLineIndex?: unknown;
+      usernameFragment?: unknown;
+    };
+    const candidateValue = String(rawCandidate.candidate ?? "");
+    const sdpMid = rawCandidate.sdpMid == null ? null : String(rawCandidate.sdpMid);
+    const sdpMLineIndex = rawCandidate.sdpMLineIndex == null ? null : Number(rawCandidate.sdpMLineIndex);
+    const usernameFragment =
+      rawCandidate.usernameFragment == null ? null : String(rawCandidate.usernameFragment);
+    if (
+      !candidateValue ||
+      candidateValue.length > 4096 ||
+      (sdpMid != null && sdpMid.length > 256) ||
+      (sdpMLineIndex != null && (!Number.isInteger(sdpMLineIndex) || sdpMLineIndex < 0)) ||
+      (usernameFragment != null && usernameFragment.length > 256)
+    ) {
+      return null;
+    }
+    candidate = { candidate: candidateValue, sdpMid, sdpMLineIndex, usernameFragment };
+  }
+
+  if (!description && !candidate) {
+    return null;
+  }
+  return { targetId, description, candidate };
+}
+
 function syncRoster() {
   const connectedClientIds = new Set<string>();
   for (const [clientId, socketId] of socketByClientId) {
@@ -1476,6 +1615,7 @@ function syncRoster() {
     } else {
       socketByClientId.delete(clientId);
       delete state.tsMap[clientId];
+      callByClientId.delete(clientId);
     }
   }
   state.roster = Array.from(connectedClientIds)
