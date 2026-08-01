@@ -1408,28 +1408,7 @@ h1 {
   color: #9be5b8;
 }
 
-.message-emoji-picker {
-  display: grid;
-  grid-template-columns: repeat(8, 30px);
-  gap: 5px;
-  width: max-content;
-  max-width: 100%;
-  margin-top: 6px;
-  border: 1px solid #303940;
-  border-radius: 6px;
-  padding: 8px;
-  background: #111518;
-}
-
-.message-emoji-picker button {
-  width: 30px;
-  min-width: 30px;
-  min-height: 30px;
-  padding: 0;
-  font-size: 18px;
-}
-
-.message-emoji-picker button.active {
+.reaction-picker .emoji-grid button.active {
   border-color: #69c08f;
   background: #1b3025;
 }

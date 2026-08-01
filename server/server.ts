@@ -36,47 +36,6 @@ const YT_MAX_HEIGHT = Number(process.env.YT_MAX_HEIGHT ?? 1080);
 const YT_PLAYLIST_MAX_ITEMS = Number(process.env.YT_PLAYLIST_MAX_ITEMS ?? 100);
 const DEBUG_YT_SEEK = process.env.DEBUG_YT_SEEK === "1";
 const SUPPORTED_EXTENSIONS = new Set([".mp4", ".webm", ".m4v", ".mov", ".m3u8"]);
-const MESSAGE_REACTIONS = new Set([
-  "\u{1F600}",
-  "\u{1F603}",
-  "\u{1F604}",
-  "\u{1F601}",
-  "\u{1F606}",
-  "\u{1F605}",
-  "\u{1F602}",
-  "\u{1F923}",
-  "\u{1F642}",
-  "\u{1F60A}",
-  "\u{1F607}",
-  "\u{1F970}",
-  "\u{1F60D}",
-  "\u{1F929}",
-  "\u{1F618}",
-  "\u{1F617}",
-  "\u{1F619}",
-  "\u{1F61A}",
-  "\u{1F60B}",
-  "\u{1F61B}",
-  "\u{1F61C}",
-  "\u{1F92A}",
-  "\u{1F61D}",
-  "\u{1F911}",
-  "\u{1F917}",
-  "\u{1F92D}",
-  "\u{1F92B}",
-  "\u{1F914}",
-  "\u{1F910}",
-  "\u{1F928}",
-  "\u{1F633}",
-  "\u{1F97A}",
-  "\u{1F44D}",
-  "\u{1F44F}",
-  "\u{1F525}",
-  "\u{2728}",
-  "\u{1F37F}",
-  "\u{2764}\u{FE0F}",
-  "\u{1F389}",
-]);
 const SPLASH_REACTIONS = new Set([
   "\u{1F916}",
   "\u{1F496}",
@@ -573,7 +532,7 @@ io.on("connection", (socket: Socket) => {
     const data = raw as { timestamp?: string; value?: string };
     const timestamp = String(data?.timestamp ?? "");
     const value = String(data?.value ?? "");
-    if (!timestamp || !MESSAGE_REACTIONS.has(value)) {
+    if (!timestamp || !isEmojiReaction(value)) {
       return;
     }
     const target = state.chat.find((message) => message.id && message.timestamp === timestamp);
@@ -1540,6 +1499,19 @@ function getCallParticipants(): CallParticipant[] {
 
 function emitCallParticipants() {
   io.emit("REC:callParticipants", getCallParticipants());
+}
+
+// Reactions may be any emoji the picker offers, so validate the shape instead
+// of keeping an allowlist: emoji sequences only, never arbitrary text.
+const EMOJI_SEQUENCE =
+  /^(?:\p{Extended_Pictographic}|\p{Regional_Indicator}|\p{Emoji_Component}|‍|️)+$/u;
+function isEmojiReaction(value: string) {
+  return (
+    value.length > 0 &&
+    value.length <= 24 &&
+    EMOJI_SEQUENCE.test(value) &&
+    /\p{Extended_Pictographic}|\p{Regional_Indicator}/u.test(value)
+  );
 }
 
 function sanitizeCallState(raw: unknown): Omit<CallParticipant, "id"> {

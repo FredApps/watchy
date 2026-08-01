@@ -116,47 +116,37 @@ for (const [code, emoji] of Object.entries(chatEmoticons)) {
 for (const [code, emoji] of Object.entries(chatShortcodes)) {
   emojiAliases[emoji] = `${emojiAliases[emoji] ?? ""} :${code}:`;
 }
-const emojiValues = [
-  "\u{1F600}",
-  "\u{1F603}",
-  "\u{1F604}",
-  "\u{1F601}",
-  "\u{1F606}",
-  "\u{1F605}",
-  "\u{1F602}",
-  "\u{1F923}",
-  "\u{1F642}",
-  "\u{1F60A}",
-  "\u{1F607}",
-  "\u{1F970}",
-  "\u{1F60D}",
-  "\u{1F929}",
-  "\u{1F618}",
-  "\u{1F617}",
-  "\u{1F619}",
-  "\u{1F61A}",
-  "\u{1F60B}",
-  "\u{1F61B}",
-  "\u{1F61C}",
-  "\u{1F92A}",
-  "\u{1F61D}",
-  "\u{1F911}",
-  "\u{1F917}",
-  "\u{1F92D}",
-  "\u{1F92B}",
-  "\u{1F914}",
-  "\u{1F910}",
-  "\u{1F928}",
-  "\u{1F633}",
-  "\u{1F97A}",
-  "\u{1F44D}",
-  "\u{1F44F}",
-  "\u{1F525}",
-  "\u{2728}",
-  "\u{1F37F}",
-  "\u{2764}\u{FE0F}",
-  "\u{1F389}",
-];
+
+// The reaction picker floats over the chat instead of sitting in the message,
+// so a wide grid can never widen the column or push it into horizontal scroll.
+const REACTION_PICKER_WIDTH = 320;
+const REACTION_PICKER_HEIGHT = 380;
+function reactionPickerStyle(anchor: { x: number; y: number }): React.CSSProperties {
+  const width = Math.min(REACTION_PICKER_WIDTH, window.innerWidth - 16);
+  const height = Math.min(REACTION_PICKER_HEIGHT, window.innerHeight - 16);
+  const left = Math.max(8, Math.min(anchor.x - width, window.innerWidth - width - 8));
+  const below = anchor.y + 6;
+  const top = below + height > window.innerHeight ? Math.max(8, anchor.y - height - 30) : below;
+  return { left, top, right: "auto", bottom: "auto", width, maxHeight: height };
+}
+
+function selectEmojis(search: string, categoryId: string) {
+  const query = search.trim().toLowerCase();
+  const values = query
+    ? chatEmojiCategories.flatMap((category) => category.values)
+    : chatEmojiCategories.find((category) => category.id === categoryId)?.values ?? chatEmojiCategories[0].values;
+  return values.filter((value, index, list) => {
+    if (list.indexOf(value) !== index) {
+      return false;
+    }
+    if (!query) {
+      return true;
+    }
+    const haystack = `${value} ${chatEmojiSearchText[value] ?? ""}${emojiAliases[value] ?? ""}`.toLowerCase();
+    // ":O" should find the emoticon; ":open" should still find it by name.
+    return haystack.includes(query) || haystack.includes(query.replace(/^:+|:+$/g, ""));
+  });
+}
 const splashValues = [
   "\u{1F916}",
   "\u{1F496}",
@@ -283,6 +273,9 @@ function WatchRoom() {
   const [emojiCategory, setEmojiCategory] = useState(chatEmojiCategories[0].id);
   const [emojiSearch, setEmojiSearch] = useState("");
   const [reactionPickerFor, setReactionPickerFor] = useState<string | null>(null);
+  const [reactionAnchor, setReactionAnchor] = useState<{ x: number; y: number } | null>(null);
+  const [reactionSearch, setReactionSearch] = useState("");
+  const [reactionCategory, setReactionCategory] = useState(chatEmojiCategories[0].id);
   const [mediaQuery, setMediaQuery] = useState("");
   const [mediaResults, setMediaResults] = useState<MediaEntry[]>([]);
   const [expandedFolders, setExpandedFolders] = useState<Record<string, MediaEntry[] | undefined>>({});
@@ -332,23 +325,39 @@ function WatchRoom() {
     const values = Object.values(tsMap).filter((value) => Number.isFinite(value));
     return values.length ? Math.max(...values) : host.videoTS;
   }, [host.videoTS, tsMap]);
-  const visibleChatEmojis = useMemo(() => {
-    const query = emojiSearch.trim().toLowerCase();
-    const values = query
-      ? chatEmojiCategories.flatMap((category) => category.values)
-      : chatEmojiCategories.find((category) => category.id === emojiCategory)?.values ?? chatEmojiCategories[0].values;
-    return values.filter((value, index, list) => {
-      if (list.indexOf(value) !== index) {
-        return false;
+  const visibleChatEmojis = useMemo(() => selectEmojis(emojiSearch, emojiCategory), [emojiCategory, emojiSearch]);
+  const reactionEmojis = useMemo(
+    () => selectEmojis(reactionSearch, reactionCategory),
+    [reactionCategory, reactionSearch],
+  );
+  const reactionTarget = useMemo(
+    () => (reactionPickerFor ? chat.find((message) => message.timestamp === reactionPickerFor) ?? null : null),
+    [chat, reactionPickerFor],
+  );
+
+  useEffect(() => {
+    if (!reactionPickerFor) {
+      return;
+    }
+    const closeOnOutside = (event: PointerEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target?.closest(".reaction-picker") || target?.closest(".message-title-actions")) {
+        return;
       }
-      if (!query) {
-        return true;
+      setReactionPickerFor(null);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setReactionPickerFor(null);
       }
-      const haystack = `${value} ${chatEmojiSearchText[value] ?? ""}${emojiAliases[value] ?? ""}`.toLowerCase();
-      // ":O" should find the emoticon; ":open" should still find it by name.
-      return haystack.includes(query) || haystack.includes(query.replace(/^:+|:+$/g, ""));
-    });
-  }, [emojiCategory, emojiSearch]);
+    };
+    document.addEventListener("pointerdown", closeOnOutside);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutside);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [reactionPickerFor]);
 
   useEffect(() => {
     if (!nameConfirmed) {
@@ -1607,6 +1616,8 @@ function WatchRoom() {
             onScroll={(event) => {
               const el = event.currentTarget;
               stickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+              // The picker is anchored to a message that just moved.
+              setReactionPickerFor(null);
             }}
           >
             {chat.map((message) => (
@@ -1631,7 +1642,12 @@ function WatchRoom() {
                       <button
                         type="button"
                         className={`icon-button ${reactionPickerFor === message.timestamp ? "active" : ""}`}
-                        onClick={() => setReactionPickerFor((current) => (current === message.timestamp ? null : message.timestamp))}
+                        onClick={(event) => {
+                          const rect = event.currentTarget.getBoundingClientRect();
+                          setReactionAnchor({ x: rect.right, y: rect.bottom });
+                          setReactionSearch("");
+                          setReactionPickerFor((current) => (current === message.timestamp ? null : message.timestamp));
+                        }}
                         title="React"
                       >
                         {"\u263A"}
@@ -1666,25 +1682,52 @@ function WatchRoom() {
                         ))}
                       </div>
                     )}
-                    {reactionPickerFor === message.timestamp && (
-                      <div className="message-emoji-picker">
-                        {emojiValues.map((value) => (
-                          <button
-                            key={value}
-                            type="button"
-                            className={message.reactions?.[value]?.includes(clientId) ? "active" : ""}
-                            onClick={() => toggleMessageReaction(message, value)}
-                          >
-                            {value}
-                          </button>
-                        ))}
-                      </div>
-                    )}
                   </>
                 )}
               </div>
             ))}
           </div>
+          {reactionTarget && reactionAnchor && (
+            <div className="emoji-picker reaction-picker" style={reactionPickerStyle(reactionAnchor)}>
+              <input
+                className="emoji-search"
+                autoFocus
+                value={reactionSearch}
+                onChange={(event) => setReactionSearch(event.target.value)}
+                placeholder="Search emoji"
+              />
+              <div className="emoji-categories">
+                {chatEmojiCategories.map((category) => (
+                  <button
+                    key={category.id}
+                    type="button"
+                    className={!reactionSearch && reactionCategory === category.id ? "active" : ""}
+                    title={category.label}
+                    aria-label={category.label}
+                    onClick={() => {
+                      setReactionCategory(category.id);
+                      setReactionSearch("");
+                    }}
+                  >
+                    {category.icon}
+                  </button>
+                ))}
+              </div>
+              <div className="emoji-grid">
+                {reactionEmojis.length === 0 && <div className="muted">No emoji found.</div>}
+                {reactionEmojis.map((value) => (
+                  <button
+                    key={value}
+                    type="button"
+                    className={reactionTarget.reactions?.[value]?.includes(clientId) ? "active" : ""}
+                    onClick={() => toggleMessageReaction(reactionTarget, value)}
+                  >
+                    {value}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
           {replyingTo && (
             <div className="editing-row">
               Replying to {nameMap[replyingTo.id] || replyingTo.name || "message"}: {truncate(replyingTo.msg, 42)}
