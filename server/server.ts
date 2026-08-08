@@ -717,6 +717,19 @@ setInterval(() => {
   }
 }, 5000);
 
+// A task-scheduler-launched process can briefly hit EADDRINUSE against a port
+// nothing is actually holding - a bind race, not a real conflict - so retry
+// a few times before giving up and letting the process exit for real.
+let listenRetries = 0;
+server.on("error", (error: NodeJS.ErrnoException) => {
+  if (error.code !== "EADDRINUSE" || listenRetries >= 5) {
+    throw error;
+  }
+  listenRetries += 1;
+  console.warn(`port ${PORT} busy, retrying (${listenRetries}/5) in 2s`);
+  setTimeout(() => server.listen(PORT, HOST), 2000);
+});
+
 server.listen(PORT, HOST, () => {
   console.log(`watchy listening on http://${HOST}:${PORT}${BASE_PATH}`);
   console.log(`media root: ${MEDIA_ROOT}`);

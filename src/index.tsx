@@ -1128,7 +1128,12 @@ function WatchRoom() {
       pendingSeekRef.current = null;
       return;
     }
-    if (canSeekTo(pending.time)) {
+    // A seek already in flight hasn't updated currentTime yet, so the check
+    // above can't see it landed. Re-issuing currentTime while the previous
+    // seek is still being decoded stacks a second seek target on top of the
+    // first - some hardware decoders (Smart TV browsers in particular) briefly
+    // play audio from both, which sounds like the track doubling up.
+    if (!target.seeking && canSeekTo(pending.time)) {
       if (debugYouTubeSeek) {
         console.info("[watchy:yt-seek] apply", { target: pending.time, current: target.currentTime });
       }
