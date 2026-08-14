@@ -49,7 +49,6 @@ const FRAMES_PER_REQUEST = 3;
 // back empty with finish_reason "length" during testing.
 const MAX_TOKENS = 600;
 const REQUEST_TIMEOUT_MS = 90_000;
-const MENTION_COOLDOWN_MS = 15_000;
 
 export const TROLL_ID = "troll-openclaw";
 export const DEFAULT_TROLL_NAME = "Troll";
@@ -88,7 +87,6 @@ export function createTroll(deps: TrollDeps) {
   let lastCommentAt = 0;
   let nextGapMs = randomGap();
   let inFlight = false;
-  let lastMentionAt = 0;
   // Held so `stop` can cancel a generation that is already running.
   let currentRun: AbortController | null = null;
 
@@ -392,11 +390,6 @@ export function createTroll(deps: TrollDeps) {
       if (!mention.test(message)) {
         return null;
       }
-      const now = Date.now();
-      if (now - lastMentionAt < MENTION_COOLDOWN_MS) {
-        return null;
-      }
-      lastMentionAt = now;
       const asked = message.replace(mention, "").trim();
       // Grab the frame at the moment of the mention first: the scheduled
       // capture can be up to 10s stale, and the answer should reflect what is
