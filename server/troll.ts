@@ -19,7 +19,20 @@ function config() {
     model: process.env.OPENCLAW_MODEL ?? "openclaw",
     discordChannel: process.env.OPENCLAW_DISCORD_CHANNEL ?? "",
     ffmpegPath: process.env.FFMPEG_PATH ?? "ffmpeg",
+    sessionKey: resolveSessionKey(),
   };
+}
+
+// Without an explicit session key the gateway mints a fresh random session per
+// request, so Troll would remember nothing between comments. Joining the
+// channel's own session key is what gives it continuity with Discord.
+function resolveSessionKey() {
+  const explicit = process.env.OPENCLAW_SESSION_KEY?.trim();
+  if (explicit) {
+    return explicit;
+  }
+  const channel = process.env.OPENCLAW_DISCORD_CHANNEL?.trim();
+  return channel ? `agent:main:discord:channel:${channel}` : "";
 }
 
 const FRAME_INTERVAL_MS = 10_000;
@@ -29,6 +42,9 @@ const MAX_COMMENT_GAP_MS = 10 * 60_000;
 // The model overshoots length instructions, so the cap is enforced in code.
 const MAX_COMMENT_CHARS = 160;
 const FRAME_BUFFER_SIZE = 6;
+// The gateway rejects more than 8 image parts per request (and 20 MB total);
+// frames are ~11 KB each, so the real cost of more frames is latency.
+const FRAMES_PER_REQUEST = 3;
 // Reasoning eats a chunk of the budget before any prose appears; 80 tokens came
 // back empty with finish_reason "length" during testing.
 const MAX_TOKENS = 600;
@@ -156,6 +172,19 @@ export function createTroll(deps: TrollDeps) {
     });
   }
 
+  // Oldest to newest, evenly spaced, always including the most recent frame.
+  function pickFrames(count: number) {
+    if (frames.length <= count) {
+      return [...frames];
+    }
+    const step = (frames.length - 1) / (count - 1);
+    const picked: string[] = [];
+    for (let index = 0; index < count; index += 1) {
+      picked.push(frames[Math.round(index * step)]);
+    }
+    return picked;
+  }
+
   async function captureFrame() {
     const context = deps.getContext();
     if (!shouldRun(context)) {
@@ -185,8 +214,13 @@ export function createTroll(deps: TrollDeps) {
     ];
     const { discordChannel } = config();
     if (discordChannel) {
+      // Troll runs inside the channel's own session, so it has the Discord
+      // tooling in reach. Right now it is speaking in the watch room instead.
       persona.push(
-        `Keep the same voice you use in Discord channel ${discordChannel}. Do not post anything to Discord.`,
+        `This is the shared session for Discord channel ${discordChannel}, so keep your usual voice and memory.`,
+        "You are NOT in Discord right now, you are in the Watchy watch room.",
+        "Never send a Discord message, never call a Discord tool, and never mirror this comment to the channel.",
+        "Your reply is delivered to the watch room automatically just by answering here.",
       );
     }
     if (context.title) {
@@ -203,9 +237,9 @@ export function createTroll(deps: TrollDeps) {
       .slice(-2000);
     const preamble = chatLines ? `Recent chat in the room:\n${chatLines}\n\n${instruction}` : instruction;
     content.push({ type: "text", text: preamble });
-    // Send an older frame alongside the newest so it reads motion, not a still.
-    const chosen = frames.length > 2 ? [frames[frames.length - 3], frames[frames.length - 1]] : frames.slice(-1);
-    for (const frame of chosen) {
+    // Spread the picks across the buffer so it reads motion over ~a minute
+    // rather than one still. The gateway caps a request at 8 image parts.
+    for (const frame of pickFrames(FRAMES_PER_REQUEST)) {
       content.push({ type: "image_url", image_url: { url: `data:image/jpeg;base64,${frame}` } });
     }
     return [
@@ -219,12 +253,13 @@ export function createTroll(deps: TrollDeps) {
     currentRun = controller;
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     try {
-      const { url, token, model } = config();
+      const { url, token, model, sessionKey } = config();
       const response = await fetch(`${url}/v1/chat/completions`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${token}`,
           "Content-Type": "application/json",
+          ...(sessionKey ? { "x-openclaw-session-key": sessionKey } : {}),
         },
         body: JSON.stringify({ model, max_tokens: MAX_TOKENS, messages }),
         signal: controller.signal,
@@ -363,11 +398,17 @@ export function createTroll(deps: TrollDeps) {
       }
       lastMentionAt = now;
       const asked = message.replace(mention, "").trim();
-      void speak(
-        asked
-          ? `Someone in the room said to you: "${asked}". Answer them directly.`
-          : "Someone called your name. Respond to the room.",
-      );
+      // Grab the frame at the moment of the mention first: the scheduled
+      // capture can be up to 10s stale, and the answer should reflect what is
+      // on screen when they asked, not what was there before.
+      void (async () => {
+        await captureFrame();
+        await speak(
+          asked
+            ? `Someone in the room said to you: "${asked}". Answer them directly.`
+            : "Someone called your name. Respond to the room.",
+        );
+      })();
       return null;
     },
   };
