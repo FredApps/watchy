@@ -627,22 +627,28 @@ function WatchRoom() {
       });
     };
 
-    updateStageSize();
-    // The very first measurement can race a layout that has not settled yet
-    // (e.g. the controls bar or reaction row has not committed its final
-    // height right as a new video swaps in), which understates the available
-    // height and gets clamped to the emergency 160x120 floor. That floor then
-    // sticks until something happens to change size on one of the observed
-    // elements themselves - which a too-small .stage does not, so nothing
-    // ever corrects it and the video is left pillarboxed. A same-frame retry
-    // after paint catches the settled layout without waiting on that.
+    // Any trigger's measurement can race a layout that has not settled yet
+    // (the controls bar or reaction row not having committed its final size,
+    // or - for fullscreenchange specifically - the browser's own fullscreen
+    // transition, including the "press Esc to exit" chrome banner, still
+    // resolving). A too-small reading gets clamped to the 160x120 emergency
+    // floor and then sticks, because a stage that small does not itself
+    // change size, so the ResizeObserver watching it has nothing further to
+    // fire on. Every trigger below therefore schedules a same-frame retry
+    // after paint, not just the initial mount measurement.
     const rafIds: number[] = [];
-    rafIds.push(
-      requestAnimationFrame(() => {
-        rafIds.push(requestAnimationFrame(updateStageSize));
-      }),
-    );
-    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(updateStageSize);
+    const updateStageSizeSafely = () => {
+      updateStageSize();
+      rafIds.push(
+        requestAnimationFrame(() => {
+          rafIds.push(requestAnimationFrame(updateStageSize));
+        }),
+      );
+    };
+
+    updateStageSizeSafely();
+    const observer =
+      typeof ResizeObserver === "undefined" ? null : new ResizeObserver(updateStageSizeSafely);
     if (watchColumnRef.current) {
       observer?.observe(watchColumnRef.current);
     }
@@ -652,15 +658,15 @@ function WatchRoom() {
     if (reactionRowRef.current) {
       observer?.observe(reactionRowRef.current);
     }
-    window.addEventListener("resize", updateStageSize);
-    document.addEventListener("fullscreenchange", updateStageSize);
-    document.addEventListener("webkitfullscreenchange", updateStageSize);
+    window.addEventListener("resize", updateStageSizeSafely);
+    document.addEventListener("fullscreenchange", updateStageSizeSafely);
+    document.addEventListener("webkitfullscreenchange", updateStageSizeSafely);
     return () => {
       rafIds.forEach((id) => cancelAnimationFrame(id));
       observer?.disconnect();
-      window.removeEventListener("resize", updateStageSize);
-      document.removeEventListener("fullscreenchange", updateStageSize);
-      document.removeEventListener("webkitfullscreenchange", updateStageSize);
+      window.removeEventListener("resize", updateStageSizeSafely);
+      document.removeEventListener("fullscreenchange", updateStageSizeSafely);
+      document.removeEventListener("webkitfullscreenchange", updateStageSizeSafely);
     };
   }, [host.video, videoAspectRatio]);
 
