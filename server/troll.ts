@@ -30,14 +30,13 @@ function resolveSessionKey() {
   if (explicit) {
     return explicit;
   }
-  // agent:main:discord:channel:<id> is a session the gateway will happily
-  // create, but it is not one the real Discord bot ever reads from or writes
-  // to - confirmed by inspecting the bot's actual live session file, which
-  // spans dozens of different channel/guild ids and contains none of that
-  // key. The bot runs a single continuous session across the whole server,
-  // addressed as agent:<agentId>:<mainKey> with both defaulting to "main"
-  // per this deployment's openclaw.json (no session.scope: "global" set).
-  return "agent:main:main";
+  // The bot really does scope its Discord memory per channel, keyed exactly
+  // like this - verified by finding the session file containing one of its
+  // actual replies. What has to be right is the channel id: it must be the
+  // channel people actually talk to the bot in, otherwise Watchy writes to a
+  // real-looking session nobody reads.
+  const channel = process.env.OPENCLAW_DISCORD_CHANNEL?.trim();
+  return channel ? `agent:main:discord:channel:${channel}` : "";
 }
 
 const FRAME_INTERVAL_MS = 10_000;
@@ -228,14 +227,14 @@ export function createTroll(deps: TrollDeps) {
       "No preamble, no quotes, no stage directions, no markdown. Just the comment.",
       "React to what you actually see on screen. Never describe the frame like a caption.",
     ];
-    // This runs inside the bot's own main session (agent:main:main), the same
-    // one its Discord conversations use, so it has the Discord tooling in
-    // reach and should keep the same voice and memory - but it is answering
-    // in the Watchy watch room right now, not Discord.
+    // This runs inside the very session the bot uses for that Discord
+    // channel, so it shares that memory and has the Discord tooling in reach
+    // - but it is answering in the Watchy watch room right now, not Discord.
     persona.push(
-      "This is your regular ongoing session, so keep your usual voice and memory.",
-      "You are NOT in Discord right now, you are in the Watchy watch room.",
-      "Never send a Discord message, never call a Discord tool, and never mirror this comment to any channel.",
+      "This is the same ongoing session as your Discord channel, so keep that voice and memory.",
+      "The people here are the same people you talk to there.",
+      "You are NOT in Discord right now, you are in the Watchy watch room, watching along with them.",
+      "Never send a Discord message, never call a Discord tool, and never mirror this comment to the channel.",
       "Your reply is delivered to the watch room automatically just by answering here.",
     );
     if (context.title) {
