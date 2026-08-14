@@ -71,6 +71,9 @@ type YouTubeResult = {
 };
 
 const basePath = "/watchy";
+// Must match TROLL_ID in server/troll.ts - the client has no import path to it.
+const TROLL_ID = "troll-openclaw";
+const DEFAULT_TROLL_COLOR = "#f5f7f8";
 const apiPath = `${basePath}/api`;
 const defaultChatWidth = 266;
 const debugYouTubeSeek = false;
@@ -263,6 +266,12 @@ function WatchRoom() {
   const [chatInput, setChatInput] = useState("");
   const [emojiSuggest, setEmojiSuggest] = useState<{
     items: EmojiSuggestion[];
+    index: number;
+    start: number;
+    end: number;
+  } | null>(null);
+  const [mentionSuggest, setMentionSuggest] = useState<{
+    items: string[];
     index: number;
     start: number;
     end: number;
@@ -911,19 +920,54 @@ function WatchRoom() {
     scrollChatToBottom();
   }
 
+  // Names people can @mention: the AI companion first (it is who this is
+  // usually for), then everyone currently in the room, deduped and excluding
+  // yourself.
+  function mentionCandidates() {
+    const names: string[] = [];
+    if (troll.configured) {
+      names.push(troll.name);
+    }
+    for (const user of roster) {
+      const displayName = nameMap[user.id] || user.name;
+      if (user.id !== clientId && displayName && !names.includes(displayName)) {
+        names.push(displayName);
+      }
+    }
+    return names;
+  }
+
+  function lookupMentionSuggestions(query: string, limit = 8) {
+    const q = query.toLowerCase();
+    return mentionCandidates()
+      .filter((candidate) => candidate.toLowerCase().startsWith(q))
+      .slice(0, limit);
+  }
+
   function handleChatInputChange(event: React.ChangeEvent<HTMLInputElement>) {
     const value = event.target.value;
     setChatInput(value);
     const caret = event.target.selectionStart ?? value.length;
-    const match = /(?:^|\s):([a-zA-Z0-9_+-]{1,})$/.exec(value.slice(0, caret));
-    if (match) {
-      const items = lookupEmojiSuggestions(match[1]);
+    const emojiMatch = /(?:^|\s):([a-zA-Z0-9_+-]{1,})$/.exec(value.slice(0, caret));
+    if (emojiMatch) {
+      const items = lookupEmojiSuggestions(emojiMatch[1]);
       if (items.length) {
-        setEmojiSuggest({ items, index: 0, start: caret - match[1].length - 1, end: caret });
+        setEmojiSuggest({ items, index: 0, start: caret - emojiMatch[1].length - 1, end: caret });
+        setMentionSuggest(null);
         return;
       }
     }
     setEmojiSuggest(null);
+
+    const mentionMatch = /(?:^|\s)@([a-zA-Z0-9_-]{0,24})$/.exec(value.slice(0, caret));
+    if (mentionMatch) {
+      const items = lookupMentionSuggestions(mentionMatch[1]);
+      if (items.length) {
+        setMentionSuggest({ items, index: 0, start: caret - mentionMatch[1].length - 1, end: caret });
+        return;
+      }
+    }
+    setMentionSuggest(null);
   }
 
   function applyEmojiSuggestion(item: EmojiSuggestion) {
@@ -944,22 +988,54 @@ function WatchRoom() {
     });
   }
 
+  function applyMentionSuggestion(mentionName: string) {
+    if (!mentionSuggest) {
+      return;
+    }
+    const { start, end } = mentionSuggest;
+    const next = `${chatInput.slice(0, start)}@${mentionName} ${chatInput.slice(end)}`;
+    setChatInput(next);
+    setMentionSuggest(null);
+    const caret = start + mentionName.length + 2;
+    requestAnimationFrame(() => {
+      const el = chatInputRef.current;
+      if (el) {
+        el.focus();
+        el.setSelectionRange(caret, caret);
+      }
+    });
+  }
+
   function handleChatInputKeyDown(event: React.KeyboardEvent<HTMLInputElement>) {
-    if (!emojiSuggest) {
+    const suggest = emojiSuggest ?? mentionSuggest;
+    if (!suggest) {
       return;
     }
     if (event.key === "ArrowDown") {
       event.preventDefault();
-      setEmojiSuggest((s) => s && { ...s, index: (s.index + 1) % s.items.length });
+      if (emojiSuggest) {
+        setEmojiSuggest((s) => s && { ...s, index: (s.index + 1) % s.items.length });
+      } else {
+        setMentionSuggest((s) => s && { ...s, index: (s.index + 1) % s.items.length });
+      }
     } else if (event.key === "ArrowUp") {
       event.preventDefault();
-      setEmojiSuggest((s) => s && { ...s, index: (s.index - 1 + s.items.length) % s.items.length });
+      if (emojiSuggest) {
+        setEmojiSuggest((s) => s && { ...s, index: (s.index - 1 + s.items.length) % s.items.length });
+      } else {
+        setMentionSuggest((s) => s && { ...s, index: (s.index - 1 + s.items.length) % s.items.length });
+      }
     } else if (event.key === "Enter" || event.key === "Tab") {
       event.preventDefault();
-      applyEmojiSuggestion(emojiSuggest.items[emojiSuggest.index]);
+      if (emojiSuggest) {
+        applyEmojiSuggestion(emojiSuggest.items[emojiSuggest.index]);
+      } else if (mentionSuggest) {
+        applyMentionSuggestion(mentionSuggest.items[mentionSuggest.index]);
+      }
     } else if (event.key === "Escape") {
       event.preventDefault();
       setEmojiSuggest(null);
+      setMentionSuggest(null);
     }
   }
 
@@ -1625,19 +1701,28 @@ function WatchRoom() {
           {troll.configured && (
             <label className="name-field">
               <span>{troll.active ? "AI companion" : "AI companion (muted)"}</span>
-              <input
-                defaultValue={troll.name}
-                key={troll.name}
-                maxLength={24}
-                placeholder="Troll"
-                title="Rename the AI companion"
-                onBlur={(event) => socket?.emit("CMD:trollName", event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") {
-                    event.currentTarget.blur();
-                  }
-                }}
-              />
+              <div className="name-row">
+                <input
+                  defaultValue={troll.name}
+                  key={troll.name}
+                  maxLength={24}
+                  placeholder="Troll"
+                  title="Rename the AI companion"
+                  onBlur={(event) => socket?.emit("CMD:trollName", event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.currentTarget.blur();
+                    }
+                  }}
+                />
+                <input
+                  className="name-color"
+                  type="color"
+                  value={colorMap[TROLL_ID] || DEFAULT_TROLL_COLOR}
+                  onChange={(event) => socket?.emit("CMD:trollColor", event.target.value)}
+                  title="AI companion color"
+                />
+              </div>
             </label>
           )}
         </div>
@@ -1858,6 +1943,23 @@ function WatchRoom() {
             </div>
           )}
           <div className="chat-input-wrap">
+            {mentionSuggest && (
+              <div className="emoji-suggest">
+                {mentionSuggest.items.map((mentionName, i) => (
+                  <button
+                    type="button"
+                    key={mentionName}
+                    className={i === mentionSuggest.index ? "active" : ""}
+                    onMouseDown={(event) => {
+                      event.preventDefault();
+                      applyMentionSuggestion(mentionName);
+                    }}
+                  >
+                    <span className="sc">@{mentionName}</span>
+                  </button>
+                ))}
+              </div>
+            )}
             {emojiSuggest && (
               <div className="emoji-suggest">
                 {emojiSuggest.items.map((item, i) => (

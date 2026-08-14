@@ -688,6 +688,15 @@ io.on("connection", (socket: Socket) => {
     });
   });
 
+  socket.on("CMD:trollColor", (raw: unknown) => {
+    const color = String(raw ?? "").trim();
+    if (!/^#[0-9a-fA-F]{6}$/.test(color)) {
+      return;
+    }
+    state.colors[TROLL_ID] = color;
+    io.emit("REC:colorMap", state.colors);
+  });
+
   socket.on("CMD:trollName", (raw: unknown) => {
     const previous = troll.getState().name;
     troll.setName(String(raw ?? ""));
