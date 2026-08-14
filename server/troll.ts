@@ -77,6 +77,7 @@ export type TrollDeps = {
   getContext: () => TrollContext;
   postMessage: (text: string) => void;
   onStateChange: (state: TrollState) => void;
+  onTypingChange: (typing: boolean) => void;
 };
 
 export function createTroll(deps: TrollDeps) {
@@ -293,24 +294,35 @@ export function createTroll(deps: TrollDeps) {
     return `${(lastSpace > MAX_COMMENT_CHARS * 0.6 ? cut.slice(0, lastSpace) : cut).trimEnd()}…`;
   }
 
-  async function speak(instruction: string) {
+  // Scheduled comments need something to look at and stay silent on failure -
+  // one more spontaneous line is not worth explaining a gateway hiccup for.
+  // A direct reply owes the person who asked an answer either way: it goes
+  // ahead with no frames rather than vanish, and reports if the call fails.
+  async function speak(instruction: string, options: { requireFrames: boolean; onFailure?: string }) {
     if (inFlight) {
+      if (options.onFailure) {
+        deps.postMessage(`${name} is still replying to someone else, try again in a moment.`);
+      }
       return;
     }
     const context = deps.getContext();
-    if (!frames.length) {
+    if (options.requireFrames && !frames.length) {
       return;
     }
     inFlight = true;
+    deps.onTypingChange(true);
     try {
       const reply = await askOpenClaw(buildMessages(context, instruction));
       if (reply?.trim()) {
         deps.postMessage(clamp(reply));
         lastCommentAt = Date.now();
         nextGapMs = randomGap();
+      } else if (options.onFailure) {
+        deps.postMessage(options.onFailure);
       }
     } finally {
       inFlight = false;
+      deps.onTypingChange(false);
     }
   }
 
@@ -322,7 +334,7 @@ export function createTroll(deps: TrollDeps) {
     if (Date.now() - lastCommentAt < nextGapMs) {
       return;
     }
-    void speak("React to what is happening on screen right now.");
+    void speak("React to what is happening on screen right now.", { requireFrames: true });
   }
 
   return {
@@ -400,6 +412,7 @@ export function createTroll(deps: TrollDeps) {
           asked
             ? `Someone in the room said to you: "${asked}". Answer them directly.`
             : "Someone called your name. Respond to the room.",
+          { requireFrames: false, onFailure: `${name} couldn't come up with anything, try again?` },
         );
       })();
       return null;

@@ -191,6 +191,34 @@ const state: WatchyState = {
 const socketByClientId = new Map<string, string>();
 const callByClientId = new Map<string, Omit<CallParticipant, "id">>();
 const MAX_CALL_PARTICIPANTS = 6;
+// clientId -> when their "typing" status expires. A real keystroke refreshes
+// it; with nobody typing it just ages out, which is why REC:typing also gets
+// re-broadcast from the sweep interval below, not only on CMD:typing.
+const typingUntil = new Map<string, number>();
+const TYPING_TIMEOUT_MS = 4000;
+let trollTyping = false;
+
+function getTypingNames(): string[] {
+  const now = Date.now();
+  const names: string[] = [];
+  if (trollTyping) {
+    names.push(troll.getState().name);
+  }
+  for (const [id, expiresAt] of typingUntil) {
+    if (expiresAt <= now) {
+      continue;
+    }
+    const displayName = state.names[id] || "Guest";
+    if (!names.includes(displayName)) {
+      names.push(displayName);
+    }
+  }
+  return names;
+}
+
+function emitTyping() {
+  io.emit("REC:typing", getTypingNames());
+}
 
 const app = express();
 const server = http.createServer(app);
@@ -229,6 +257,10 @@ const troll = createTroll({
     });
   },
   onStateChange: (next) => io.emit("REC:trollState", next),
+  onTypingChange: (typing) => {
+    trollTyping = typing;
+    emitTyping();
+  },
 });
 
 app.disable("x-powered-by");
@@ -542,6 +574,9 @@ io.on("connection", (socket: Socket) => {
       chatMessage.replyToTimestamp = replyTarget.timestamp;
     }
     addChat(chatMessage);
+    if (typingUntil.delete(clientId)) {
+      emitTyping();
+    }
     const acknowledgement = troll.handleChat(msg);
     if (acknowledgement) {
       addSystemChat(clientId, acknowledgement);
@@ -688,6 +723,11 @@ io.on("connection", (socket: Socket) => {
     });
   });
 
+  socket.on("CMD:typing", () => {
+    typingUntil.set(clientId, Date.now() + TYPING_TIMEOUT_MS);
+    emitTyping();
+  });
+
   socket.on("CMD:trollColor", (raw: unknown) => {
     const color = String(raw ?? "").trim();
     if (!/^#[0-9a-fA-F]{6}$/.test(color)) {
@@ -750,6 +790,9 @@ io.on("connection", (socket: Socket) => {
       socketByClientId.delete(clientId);
       delete state.tsMap[clientId];
       callByClientId.delete(clientId);
+      if (typingUntil.delete(clientId)) {
+        emitTyping();
+      }
       syncRoster();
       emitRoster();
       emitCallParticipants();
@@ -772,6 +815,20 @@ setInterval(() => {
     emitRoster();
   }
 }, 5000);
+
+setInterval(() => {
+  const now = Date.now();
+  let expired = false;
+  for (const [id, expiresAt] of typingUntil) {
+    if (expiresAt <= now) {
+      typingUntil.delete(id);
+      expired = true;
+    }
+  }
+  if (expired) {
+    emitTyping();
+  }
+}, 1000);
 
 // A task-scheduler-launched process can briefly hit EADDRINUSE against a port
 // nothing is actually holding - a bind race, not a real conflict - so retry

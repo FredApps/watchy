@@ -1498,6 +1498,15 @@ h1 {
   font-size: 22px;
 }
 
+.typing-indicator {
+  overflow: hidden;
+  color: #8d989f;
+  font-size: 12px;
+  font-style: italic;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
 .chat-input-wrap {
   position: relative;
 }

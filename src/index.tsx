@@ -85,6 +85,14 @@ type EmojiSuggestion = { code: string; emoji: string };
 const chatShortcodes: Record<string, string> = { ...chatEmojiShortcodes, ...joypixelsShortcodes };
 // Shortest first, so ":smile" offers :smile: ahead of :smiling_face_with_tear:.
 const shortcodeList = Object.keys(chatShortcodes).sort((a, b) => a.length - b.length || a.localeCompare(b));
+function formatTypingNames(names: string[]) {
+  const verb = names.length > 1 ? "are" : "is";
+  if (names.length <= 2) {
+    return `${names.join(" and ")} ${verb} typing…`;
+  }
+  return `${names.slice(0, 2).join(", ")} and ${names.length - 2} more ${verb} typing…`;
+}
+
 function lookupEmojiSuggestions(query: string, limit = 8): EmojiSuggestion[] {
   const q = query.toLowerCase();
   const starts: string[] = [];
@@ -270,6 +278,8 @@ function WatchRoom() {
     start: number;
     end: number;
   } | null>(null);
+  const [typingNames, setTypingNames] = useState<string[]>([]);
+  const lastTypingEmitRef = useRef(0);
   const [mentionSuggest, setMentionSuggest] = useState<{
     items: string[];
     index: number;
@@ -431,6 +441,7 @@ function WatchRoom() {
       setTroll(data),
     );
     nextSocket.on("roster", (data: User[]) => setRoster(data));
+    nextSocket.on("REC:typing", (data: string[]) => setTypingNames(data));
     nextSocket.on("REC:splashReaction", (data: SplashReaction) => {
       setSplashes((prev) => [...prev, data]);
       window.setTimeout(() => {
@@ -947,6 +958,15 @@ function WatchRoom() {
   function handleChatInputChange(event: React.ChangeEvent<HTMLInputElement>) {
     const value = event.target.value;
     setChatInput(value);
+    if (value.trim() && socket) {
+      // The server-side status expires after 4s on its own; re-announcing
+      // every keystroke would be one emit per letter, so throttle to that.
+      const now = Date.now();
+      if (now - lastTypingEmitRef.current > 3000) {
+        lastTypingEmitRef.current = now;
+        socket.emit("CMD:typing");
+      }
+    }
     const caret = event.target.selectionStart ?? value.length;
     const emojiMatch = /(?:^|\s):([a-zA-Z0-9_+-]{1,})$/.exec(value.slice(0, caret));
     if (emojiMatch) {
@@ -1941,6 +1961,9 @@ function WatchRoom() {
                 ))}
               </div>
             </div>
+          )}
+          {typingNames.length > 0 && (
+            <div className="typing-indicator">{formatTypingNames(typingNames)}</div>
           )}
           <div className="chat-input-wrap">
             {mentionSuggest && (
