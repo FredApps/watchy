@@ -90,9 +90,21 @@ export function createTroll(deps: TrollDeps) {
   let inFlight = false;
   // Held so `stop` can cancel a generation that is already running.
   let currentRun: AbortController | null = null;
+  // Time spent paused within the current comment window, so pausing freezes
+  // the countdown to the next comment instead of it either continuing to run
+  // out in the background or snapping back to a fresh full interval.
+  let pausedSince: number | null = null;
+  let pausedAccumMs = 0;
 
   function randomGap() {
     return MIN_COMMENT_GAP_MS + Math.random() * (MAX_COMMENT_GAP_MS - MIN_COMMENT_GAP_MS);
+  }
+
+  function resetCommentWindow() {
+    lastCommentAt = Date.now();
+    nextGapMs = randomGap();
+    pausedAccumMs = 0;
+    pausedSince = null;
   }
 
   function configured() {
@@ -315,8 +327,7 @@ export function createTroll(deps: TrollDeps) {
       const reply = await askOpenClaw(buildMessages(context, instruction));
       if (reply?.trim()) {
         deps.postMessage(clamp(reply));
-        lastCommentAt = Date.now();
-        nextGapMs = randomGap();
+        resetCommentWindow();
       } else if (options.onFailure) {
         deps.postMessage(options.onFailure);
       }
@@ -331,7 +342,12 @@ export function createTroll(deps: TrollDeps) {
     if (!shouldRun(context) || inFlight) {
       return;
     }
-    if (Date.now() - lastCommentAt < nextGapMs) {
+    // Paused time does not count toward the gap: it is subtracted out here
+    // rather than advancing lastCommentAt when the pause ends, so a comment
+    // that was 90% of the way to due before a pause is still 90% of the way
+    // there after - not reset, and not instantly overdue either.
+    const elapsed = Date.now() - lastCommentAt - pausedAccumMs;
+    if (elapsed < nextGapMs) {
       return;
     }
     void speak("React to what is happening on screen right now.", { requireFrames: true });
@@ -352,6 +368,19 @@ export function createTroll(deps: TrollDeps) {
       name = clean;
       deps.onStateChange(getState());
     },
+    // Called from CMD:play / CMD:pause so the countdown can freeze exactly at
+    // the moment playback actually stops, rather than estimating it from a
+    // 10-30s poll.
+    notifyPaused(paused: boolean) {
+      if (paused) {
+        pausedSince ??= Date.now();
+        return;
+      }
+      if (pausedSince !== null) {
+        pausedAccumMs += Date.now() - pausedSince;
+        pausedSince = null;
+      }
+    },
     /**
      * Handles a chat message. Returns a short acknowledgement for the bare
      * `stop` / `pause` / `resume` commands, or null when the message was not a
@@ -366,8 +395,7 @@ export function createTroll(deps: TrollDeps) {
           // Cancel whatever is being generated right now; stay watching.
           currentRun?.abort();
           currentRun = null;
-          lastCommentAt = Date.now();
-          nextGapMs = randomGap();
+          resetCommentWindow();
           return `stopped ${name}'s current job`;
         }
         case "pause": {
@@ -386,8 +414,7 @@ export function createTroll(deps: TrollDeps) {
           }
           muted = false;
           // Start the clock fresh so resuming does not fire a comment instantly.
-          lastCommentAt = Date.now();
-          nextGapMs = randomGap();
+          resetCommentWindow();
           deps.onStateChange(getState());
           return `unmuted ${name}`;
         }

@@ -497,6 +497,7 @@ io.on("connection", (socket: Socket) => {
 
   socket.on("CMD:play", () => {
     state.paused = false;
+    troll.notifyPaused(false);
     io.emit("REC:play");
     addSystemChat(clientId, "started the video");
     io.emit("REC:host", getHostState());
@@ -504,6 +505,7 @@ io.on("connection", (socket: Socket) => {
 
   socket.on("CMD:pause", () => {
     state.paused = true;
+    troll.notifyPaused(true);
     io.emit("REC:pause");
     addSystemChat(clientId, "paused the video");
     io.emit("REC:host", getHostState());
