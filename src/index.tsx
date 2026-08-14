@@ -948,6 +948,22 @@ function WatchRoom() {
     return names;
   }
 
+  // Everyone an @mention could color when rendered - unlike the autocomplete
+  // list above, this includes yourself: someone else may have mentioned you.
+  function chatMentionTargets(): MentionTarget[] {
+    const targets: MentionTarget[] = [];
+    if (troll.configured) {
+      targets.push({ name: troll.name, color: colorMap[TROLL_ID] || DEFAULT_TROLL_COLOR });
+    }
+    for (const user of roster) {
+      const displayName = nameMap[user.id] || user.name;
+      if (displayName && !targets.some((target) => target.name === displayName)) {
+        targets.push({ name: displayName, color: colorMap[user.id] });
+      }
+    }
+    return targets;
+  }
+
   function lookupMentionSuggestions(query: string, limit = 8) {
     const q = query.toLowerCase();
     return mentionCandidates()
@@ -1174,6 +1190,7 @@ function WatchRoom() {
     setTimelineHover({ x: ratio * 100, time: ratio * maxTime });
   }
 
+  const chatMentions = chatMentionTargets();
   const timelineMax = Number.isFinite(duration) && duration > 0 ? duration : Math.max(currentTime, leaderTime, 1);
   const timelineValue = Math.max(0, Math.min(scrubTime ?? currentTime, timelineMax));
 
@@ -1843,10 +1860,10 @@ function WatchRoom() {
                     <strong style={{ color: message.replyToId ? colorMap[message.replyToId] : undefined }}>
                       {message.replyToName || "Someone"}
                     </strong>
-                    <span>{renderMarkdown(message.replyToMsg)}</span>
+                    <span>{renderMarkdown(message.replyToMsg, chatMentions)}</span>
                   </div>
                 )}
-                <div className="message-body">{renderMarkdown(message.msg)}</div>
+                <div className="message-body">{renderMarkdown(message.msg, chatMentions)}</div>
                 {message.id && (
                   <>
                     {Object.entries(message.reactions ?? {}).length > 0 && (
@@ -2029,7 +2046,13 @@ function WatchRoom() {
   );
 }
 
-function renderMarkdown(input: string): React.ReactNode[] {
+type MentionTarget = { name: string; color?: string };
+
+function escapeRegExp(input: string) {
+  return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function renderMarkdown(input: string, mentions: MentionTarget[]): React.ReactNode[] {
   const lines = input.split("\n");
   const bulletPattern = /^\s*[-*]\s+(.*)$/;
   const orderedPattern = /^\s*\d+[.)]\s+(.*)$/;
@@ -2101,10 +2124,10 @@ function renderMarkdown(input: string): React.ReactNode[] {
       if (tripleQuote) {
         // `>>> ` quotes everything that follows.
         const first = line.slice(4);
-        quoteLines.push(...renderMarkdownLine(first, `q-${index}`));
+        quoteLines.push(...renderMarkdownLine(first, `q-${index}`, mentions));
         index++;
         while (index < lines.length) {
-          quoteLines.push(<br key={`qbr-${index}`} />, ...renderMarkdownLine(lines[index], `q-${index}`));
+          quoteLines.push(<br key={`qbr-${index}`} />, ...renderMarkdownLine(lines[index], `q-${index}`, mentions));
           index++;
         }
       } else {
@@ -2114,7 +2137,7 @@ function renderMarkdown(input: string): React.ReactNode[] {
           if (!first) {
             quoteLines.push(<br key={`qbr-${index}`} />);
           }
-          quoteLines.push(...renderMarkdownLine(content, `q-${index}`));
+          quoteLines.push(...renderMarkdownLine(content, `q-${index}`, mentions));
           first = false;
           index++;
         }
@@ -2137,7 +2160,7 @@ function renderMarkdown(input: string): React.ReactNode[] {
       flushBlocks();
       blocks.push(
         <div key={`sub-${blockKey++}`} className="chat-subtext">
-          {renderMarkdownLine(subtext[1], `sub-${index}`)}
+          {renderMarkdownLine(subtext[1], `sub-${index}`, mentions)}
         </div>,
       );
     } else if (header) {
@@ -2145,7 +2168,7 @@ function renderMarkdown(input: string): React.ReactNode[] {
       const level = header[1].length;
       blocks.push(
         <div key={`h-${blockKey++}`} className={`chat-h${level}`}>
-          {renderMarkdownLine(header[2], `h-${index}`)}
+          {renderMarkdownLine(header[2], `h-${index}`, mentions)}
         </div>,
       );
     } else if (bullet || ordered) {
@@ -2156,21 +2179,28 @@ function renderMarkdown(input: string): React.ReactNode[] {
       }
       listType = type;
       const content = bullet ? bullet[1] : ordered![1];
-      listItems.push(<li key={`li-${index}`}>{renderMarkdownLine(content, `li-${index}`)}</li>);
+      listItems.push(<li key={`li-${index}`}>{renderMarkdownLine(content, `li-${index}`, mentions)}</li>);
     } else {
       flushList();
       if (para.length) {
         para.push(<br key={`br-${index}`} />);
       }
-      para.push(...renderMarkdownLine(line, `line-${index}`));
+      para.push(...renderMarkdownLine(line, `line-${index}`, mentions));
     }
   }
   flushBlocks();
   return blocks;
 }
 
-function renderMarkdownLine(input: string, keyPrefix: string): React.ReactNode[] {
+function renderMarkdownLine(input: string, keyPrefix: string, mentions: MentionTarget[]): React.ReactNode[] {
   const nodes: React.ReactNode[] = [];
+  // Longest name first: if one participant's name is a prefix of another's
+  // (e.g. "Troll" and "Trolley"), the longer literal match must win.
+  const mentionNames = [...mentions].sort((a, b) => b.name.length - a.name.length);
+  const mentionColorByLower = new Map(mentions.map((m) => [m.name.toLowerCase(), m.color]));
+  const mentionPattern = mentionNames.length
+    ? `(@(?:${mentionNames.map((m) => escapeRegExp(m.name)).join("|")}))\\b`
+    : null;
   // Ordered by precedence: longer delimiters first so e.g. *** is not eaten by **.
   const tokenPattern = new RegExp(
     [
@@ -2186,6 +2216,7 @@ function renderMarkdownLine(input: string, keyPrefix: string): React.ReactNode[]
       "_([\\s\\S]+?)_", // _italic_
       ":([a-zA-Z0-9_+-]+):", // :shortcode:
       `(^|\\s)(${emoticonPattern})(?=\\s|$)`, // :) and friends, standalone only
+      ...(mentionPattern ? [mentionPattern] : []), // @Name, colored like the mention-trigger match
     ].join("|"),
     "gi",
   );
@@ -2211,9 +2242,10 @@ function renderMarkdownLine(input: string, keyPrefix: string): React.ReactNode[]
       shortcode,
       emoticonLead,
       emoticon,
+      mentionTag,
     ] = match;
     const key = `${keyPrefix}-${match.index}`;
-    const inner = (text: string) => renderMarkdownLine(text, key);
+    const inner = (text: string) => renderMarkdownLine(text, key, mentions);
     if (linkUrl && linkText) {
       nodes.push(
         <a key={key} href={linkUrl} target="_blank" rel="noreferrer">
@@ -2265,6 +2297,13 @@ function renderMarkdownLine(input: string, keyPrefix: string): React.ReactNode[]
     } else if (emoticon) {
       const emoji = chatEmoticons[emoticon.toLowerCase()];
       nodes.push(emoji ? `${emoticonLead}${emoji}` : raw);
+    } else if (mentionTag) {
+      const color = mentionColorByLower.get(mentionTag.slice(1).toLowerCase());
+      nodes.push(
+        <span key={key} className="chat-mention" style={color ? { color } : undefined}>
+          {mentionTag}
+        </span>,
+      );
     }
     cursor = match.index + raw.length;
   }

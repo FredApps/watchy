@@ -1216,6 +1216,10 @@ h1 {
   color: #8fc7ff;
 }
 
+.chat-mention {
+  font-weight: 700;
+}
+
 .message-body code,
 .reply-quote code {
   border: 1px solid #3d474d;
