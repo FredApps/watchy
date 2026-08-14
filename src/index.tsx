@@ -628,6 +628,20 @@ function WatchRoom() {
     };
 
     updateStageSize();
+    // The very first measurement can race a layout that has not settled yet
+    // (e.g. the controls bar or reaction row has not committed its final
+    // height right as a new video swaps in), which understates the available
+    // height and gets clamped to the emergency 160x120 floor. That floor then
+    // sticks until something happens to change size on one of the observed
+    // elements themselves - which a too-small .stage does not, so nothing
+    // ever corrects it and the video is left pillarboxed. A same-frame retry
+    // after paint catches the settled layout without waiting on that.
+    const rafIds: number[] = [];
+    rafIds.push(
+      requestAnimationFrame(() => {
+        rafIds.push(requestAnimationFrame(updateStageSize));
+      }),
+    );
     const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(updateStageSize);
     if (watchColumnRef.current) {
       observer?.observe(watchColumnRef.current);
@@ -642,6 +656,7 @@ function WatchRoom() {
     document.addEventListener("fullscreenchange", updateStageSize);
     document.addEventListener("webkitfullscreenchange", updateStageSize);
     return () => {
+      rafIds.forEach((id) => cancelAnimationFrame(id));
       observer?.disconnect();
       window.removeEventListener("resize", updateStageSize);
       document.removeEventListener("fullscreenchange", updateStageSize);
