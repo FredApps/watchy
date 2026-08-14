@@ -1201,14 +1201,14 @@ h1 {
 
 .message {
   position: relative;
-  font-size: 18px;
+  font-size: 13px;
   line-height: 1.35;
   overflow-wrap: anywhere;
 }
 
 .message.system {
   color: #b7c0c6;
-  font-size: 17px;
+  font-size: 13px;
 }
 
 .message-body a,
@@ -1333,7 +1333,7 @@ h1 {
   align-items: baseline;
   gap: 8px;
   color: #a5b0b7;
-  font-size: 16px;
+  font-size: 13px;
 }
 
 .message-meta strong {
