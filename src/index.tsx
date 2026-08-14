@@ -290,6 +290,7 @@ function WatchRoom() {
   const [duration, setDuration] = useState(0);
   const [timelineHover, setTimelineHover] = useState<{ x: number; time: number } | null>(null);
   const [callControlsTarget, setCallControlsTarget] = useState<HTMLDivElement | null>(null);
+  const [troll, setTroll] = useState({ active: false, name: "Troll", configured: false });
   const [scrubTime, setScrubTime] = useState<number | null>(null);
   const [videoAspectRatio, setVideoAspectRatio] = useState(16 / 9);
   const [stageSize, setStageSize] = useState<{ width?: number; height?: number }>({});
@@ -312,9 +313,12 @@ function WatchRoom() {
   const controlsRef = useRef<HTMLDivElement | null>(null);
   const reactionRowRef = useRef<HTMLDivElement | null>(null);
   const localMediaPanelRef = useRef<HTMLElement | null>(null);
+  const previousMediaRootOpenRef = useRef(true);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const messagesRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
+  const scrubValueRef = useRef<number | null>(null);
+  const scrubNeedsCommitRef = useRef(false);
   const chatInputRef = useRef<HTMLInputElement | null>(null);
   const shouldPlayRef = useRef(false);
   const hlsRef = useRef<any>(null);
@@ -414,6 +418,9 @@ function WatchRoom() {
       setChat((prev) => [...prev, message].slice(-100));
     });
     nextSocket.on("playlist", (data: PlaylistItem[]) => setPlaylist(data));
+    nextSocket.on("REC:trollState", (data: { active: boolean; name: string; configured: boolean }) =>
+      setTroll(data),
+    );
     nextSocket.on("roster", (data: User[]) => setRoster(data));
     nextSocket.on("REC:splashReaction", (data: SplashReaction) => {
       setSplashes((prev) => [...prev, data]);
@@ -463,6 +470,8 @@ function WatchRoom() {
       return;
     }
 
+    clearPendingSeekTimers();
+    pendingSeekRef.current = null;
     if (host.videoTS > 0) {
       queuePendingSeek(host.videoTS);
     }
@@ -622,6 +631,8 @@ function WatchRoom() {
 
   useEffect(() => {
     const panel = localMediaPanelRef.current;
+    const wasOpen = previousMediaRootOpenRef.current;
+    previousMediaRootOpenRef.current = mediaRootOpen;
     if (!panel || !mediaRootOpen) {
       return;
     }
@@ -633,12 +644,30 @@ function WatchRoom() {
       frame = window.requestAnimationFrame(() => {
         const viewportBottom = viewport ? viewport.offsetTop + viewport.height : window.innerHeight;
         const panelTop = panel.getBoundingClientRect().top;
-        const availableHeight = Math.max(120, Math.min(680, Math.floor(viewportBottom - panelTop - 12)));
+        // The title, search box, root folder button, gaps and padding eat a
+        // fixed slice of the panel before the file list gets a single pixel.
+        // Flooring the panel below that collapses the list to nothing while
+        // every row still renders, so opening the folder looks like it does
+        // nothing at all. Measure the chrome and always leave the list room.
+        const list = panel.querySelector<HTMLElement>(".media-list");
+        const chromeHeight = list
+          ? list.getBoundingClientRect().top - panelTop + 12
+          : 140;
+        const minHeight = Math.ceil(chromeHeight) + 160;
+        const availableHeight = Math.max(minHeight, Math.min(680, Math.floor(viewportBottom - panelTop - 12)));
         panel.style.setProperty("--local-media-height", `${availableHeight}px`);
       });
     };
 
     updateHeight();
+    const scrollTimer = wasOpen
+      ? undefined
+      : window.setTimeout(() => {
+          const viewportBottom = viewport ? viewport.offsetTop + viewport.height : window.innerHeight;
+          if (panel.getBoundingClientRect().bottom > viewportBottom) {
+            panel.scrollIntoView({ block: "nearest", behavior: "smooth" });
+          }
+        }, 60);
     window.addEventListener("resize", updateHeight);
     window.addEventListener("scroll", updateHeight, { passive: true });
     viewport?.addEventListener("resize", updateHeight);
@@ -646,6 +675,9 @@ function WatchRoom() {
 
     return () => {
       window.cancelAnimationFrame(frame);
+      if (scrollTimer !== undefined) {
+        window.clearTimeout(scrollTimer);
+      }
       window.removeEventListener("resize", updateHeight);
       window.removeEventListener("scroll", updateHeight);
       viewport?.removeEventListener("resize", updateHeight);
@@ -1049,8 +1081,20 @@ function WatchRoom() {
   const timelineMax = Number.isFinite(duration) && duration > 0 ? duration : Math.max(currentTime, leaderTime, 1);
   const timelineValue = Math.max(0, Math.min(scrubTime ?? currentTime, timelineMax));
 
-  function commitScrub(event: React.SyntheticEvent<HTMLInputElement>) {
+  function updateScrub(event: React.ChangeEvent<HTMLInputElement>) {
     const value = Number(event.currentTarget.value);
+    scrubValueRef.current = value;
+    scrubNeedsCommitRef.current = true;
+    setScrubTime(value);
+  }
+
+  function commitScrub(event: React.SyntheticEvent<HTMLInputElement>) {
+    if (!scrubNeedsCommitRef.current) {
+      return;
+    }
+    const value = scrubValueRef.current ?? Number(event.currentTarget.value);
+    scrubNeedsCommitRef.current = false;
+    scrubValueRef.current = null;
     setScrubTime(null);
     seek(value);
   }
@@ -1086,7 +1130,7 @@ function WatchRoom() {
   }
 
   function queuePendingSeek(time: number) {
-    if (time <= 0) {
+    if (!Number.isFinite(time) || time < 0) {
       return;
     }
     if (debugYouTubeSeek) {
@@ -1120,7 +1164,8 @@ function WatchRoom() {
       pendingSeekRef.current = null;
       return;
     }
-    if (Math.abs(target.currentTime - pending.time) <= 2) {
+    const settleTolerance = pending.time === 0 ? 0.25 : 2;
+    if (Math.abs(target.currentTime - pending.time) <= settleTolerance) {
       if (debugYouTubeSeek) {
         console.info("[watchy:yt-seek] settled", { target: pending.time, current: target.currentTime });
       }
@@ -1327,11 +1372,16 @@ function WatchRoom() {
                 step={0.1}
                 value={timelineValue}
                 style={{ "--fill": timelineMax > 0 ? timelineValue / timelineMax : 0 } as React.CSSProperties}
-                onChange={(event) => setScrubTime(Number(event.target.value))}
+                onChange={updateScrub}
+                onPointerDown={() => {
+                  scrubNeedsCommitRef.current = false;
+                  scrubValueRef.current = null;
+                }}
                 onPointerUp={commitScrub}
+                onPointerCancel={commitScrub}
                 onKeyUp={commitScrub}
                 onBlur={(event) => {
-                  if (scrubTime !== null) {
+                  if (scrubNeedsCommitRef.current) {
                     commitScrub(event);
                   }
                 }}
@@ -1555,19 +1605,42 @@ function WatchRoom() {
           </div>
         )}
 
-        <label className="name-field">
-          <span>Name</span>
-          <div className="name-row">
-            <input value={name} onChange={(event) => setName(event.target.value)} />
-            <input
-              className="name-color"
-              type="color"
-              value={nameColor}
-              onChange={(event) => setNameColor(event.target.value)}
-              title="Name color"
-            />
-          </div>
-        </label>
+        {/* One grid child: the side column's row template is fixed, so an extra
+            child here would push chat off its 1fr row and collapse it. */}
+        <div className="identity-fields">
+          <label className="name-field">
+            <span>Name</span>
+            <div className="name-row">
+              <input value={name} onChange={(event) => setName(event.target.value)} />
+              <input
+                className="name-color"
+                type="color"
+                value={nameColor}
+                onChange={(event) => setNameColor(event.target.value)}
+                title="Name color"
+              />
+            </div>
+          </label>
+
+          {troll.configured && (
+            <label className="name-field">
+              <span>{troll.active ? "AI companion" : "AI companion (muted)"}</span>
+              <input
+                defaultValue={troll.name}
+                key={troll.name}
+                maxLength={24}
+                placeholder="Troll"
+                title="Rename the AI companion"
+                onBlur={(event) => socket?.emit("CMD:trollName", event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.currentTarget.blur();
+                  }
+                }}
+              />
+            </label>
+          )}
+        </div>
 
         <section className="chat">
           <div className="chat-heading">

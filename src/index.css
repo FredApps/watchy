@@ -978,6 +978,12 @@ h1 {
   justify-self: center;
 }
 
+.identity-fields {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
 .name-field {
   display: grid;
   gap: 6px;

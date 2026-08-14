@@ -9,6 +9,7 @@ import { Readable } from "node:stream";
 import { promisify } from "node:util";
 import { Server, type Socket } from "socket.io";
 import { Innertube } from "youtubei.js";
+import { createTroll, TROLL_ID } from "./troll.ts";
 
 // Load .env from the project root so config (password, cookie secret) survives
 // restarts regardless of how the process is launched (e.g. Task Scheduler).
@@ -198,6 +199,38 @@ const io = new Server(server, {
   transports: ["websocket", "polling"],
 });
 
+const troll = createTroll({
+  mediaRoot: MEDIA_ROOT,
+  mediaBaseUrl: MEDIA_BASE_URL,
+  resolveMediaPath: async (relative) => {
+    try {
+      const rootReal = await fs.realpath(MEDIA_ROOT);
+      const resolved = await resolveSafeMediaPath(rootReal, relative);
+      return resolved === rootReal ? null : resolved;
+    } catch {
+      return null;
+    }
+  },
+  getContext: () => ({
+    video: state.video,
+    videoTS: state.videoTS,
+    paused: state.paused,
+    viewers: state.roster.length,
+    title: currentVideoTitle(),
+    recentChat: state.chat.slice(-15).map((message) => ({ name: message.name, msg: message.msg })),
+  }),
+  postMessage: (text) => {
+    addChat({
+      id: TROLL_ID,
+      name: troll.getState().name,
+      msg: text,
+      timestamp: new Date().toISOString(),
+      videoTS: state.videoTS,
+    });
+  },
+  onStateChange: (next) => io.emit("REC:trollState", next),
+});
+
 app.disable("x-powered-by");
 app.use(express.json({ limit: "64kb" }));
 app.use(compression());
@@ -367,6 +400,7 @@ io.on("connection", (socket: Socket) => {
   socket.emit("REC:tsMap", state.tsMap);
   socket.emit("chatinit", state.chat);
   socket.emit("playlist", state.playlist);
+  socket.emit("REC:trollState", troll.getState());
   if (state.video && !state.paused) {
     socket.emit("REC:play");
   }
@@ -508,6 +542,10 @@ io.on("connection", (socket: Socket) => {
       chatMessage.replyToTimestamp = replyTarget.timestamp;
     }
     addChat(chatMessage);
+    const acknowledgement = troll.handleChat(msg);
+    if (acknowledgement) {
+      addSystemChat(clientId, acknowledgement);
+    }
   });
 
   socket.on("CMD:editChat", (raw: unknown) => {
@@ -650,6 +688,15 @@ io.on("connection", (socket: Socket) => {
     });
   });
 
+  socket.on("CMD:trollName", (raw: unknown) => {
+    const previous = troll.getState().name;
+    troll.setName(String(raw ?? ""));
+    const current = troll.getState().name;
+    if (current !== previous) {
+      addSystemChat(clientId, `renamed ${previous} to ${current}`);
+    }
+  });
+
   socket.on("CMD:callState", (raw: unknown) => {
     const requested = sanitizeCallState(raw);
     const publishers = Array.from(callByClientId).filter(
@@ -723,17 +770,26 @@ setInterval(() => {
 let listenRetries = 0;
 server.on("error", (error: NodeJS.ErrnoException) => {
   if (error.code !== "EADDRINUSE" || listenRetries >= 5) {
-    throw error;
+    // Exit rather than throw: background timers keep the event loop alive, so a
+    // process that never bound would otherwise linger forever and the task's
+    // IgnoreNew policy would refuse to start a healthy replacement.
+    console.error(`fatal: could not listen on ${HOST}:${PORT}`, error.message);
+    process.exit(1);
   }
   listenRetries += 1;
   console.warn(`port ${PORT} busy, retrying (${listenRetries}/5) in 2s`);
   setTimeout(() => server.listen(PORT, HOST), 2000);
 });
 
-server.listen(PORT, HOST, () => {
+function onListening() {
   console.log(`watchy listening on http://${HOST}:${PORT}${BASE_PATH}`);
   console.log(`media root: ${MEDIA_ROOT}`);
-});
+  // Only sample frames once the room is actually serving.
+  troll.start();
+}
+
+server.once("listening", onListening);
+server.listen(PORT, HOST);
 
 function requireAuth(req: Request, res: Response, next: NextFunction) {
   if (!verifyAuthToken(parseCookies(req.headers.cookie)[COOKIE_NAME])) {
@@ -961,6 +1017,25 @@ function makeMediaFile(relative: string): PlaylistItem {
     duration: 0,
     type: "file",
   };
+}
+
+function currentVideoTitle() {
+  if (!state.video) {
+    return "";
+  }
+  const queued = state.playlist.find((item) => item.url === state.video);
+  if (queued?.name) {
+    return queued.name;
+  }
+  const fromHistory = state.ytHistory.find((item) => state.video.includes(item.id));
+  if (fromHistory?.title) {
+    return fromHistory.title;
+  }
+  try {
+    return decodeURIComponent(state.video.split("/").pop() ?? "");
+  } catch {
+    return "";
+  }
 }
 
 function normalizeMediaRelativePath(input: string) {
