@@ -295,15 +295,29 @@ export function createTroll(deps: TrollDeps) {
     }
   }
 
-  // The model ignores the character limit, so trim to a word boundary.
+  // The model ignores the character limit and often keeps going for another
+  // sentence or two, so this has real trimming to do on a regular basis - not
+  // just an edge case. Cutting at a bare word boundary can land mid-clause
+  // ("...who's never...") and read as broken rather than short. Prefer the
+  // last complete sentence within the limit; only fall back to a word-boundary
+  // + ellipsis cut when the reply is one long run-on with no earlier sentence
+  // break to land on.
   function clamp(text: string) {
     const clean = text.replace(/\s+/g, " ").replace(/^["'\s]+|["'\s]+$/g, "");
     if (clean.length <= MAX_COMMENT_CHARS) {
       return clean;
     }
-    const cut = clean.slice(0, MAX_COMMENT_CHARS - 1);
-    const lastSpace = cut.lastIndexOf(" ");
-    return `${(lastSpace > MAX_COMMENT_CHARS * 0.6 ? cut.slice(0, lastSpace) : cut).trimEnd()}…`;
+    const cut = clean.slice(0, MAX_COMMENT_CHARS);
+    let sentenceEnd = -1;
+    for (const match of cut.matchAll(/[.!?](?=\s|$)/g)) {
+      sentenceEnd = match.index + 1;
+    }
+    if (sentenceEnd > MAX_COMMENT_CHARS * 0.4) {
+      return cut.slice(0, sentenceEnd).trimEnd();
+    }
+    const wordCut = cut.slice(0, MAX_COMMENT_CHARS - 1);
+    const lastSpace = wordCut.lastIndexOf(" ");
+    return `${(lastSpace > MAX_COMMENT_CHARS * 0.6 ? wordCut.slice(0, lastSpace) : wordCut).trimEnd()}…`;
   }
 
   // Scheduled comments need something to look at and stay silent on failure -
