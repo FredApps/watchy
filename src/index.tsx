@@ -589,11 +589,14 @@ function WatchRoom() {
   }, [socket, host.video]);
 
   useEffect(() => {
+    // Returns true when the layout looked unsettled (raw numbers landed at or
+    // below the emergency floor before it was applied) - the caller uses this
+    // to decide whether to keep retrying.
     const updateStageSize = () => {
       const column = watchColumnRef.current;
       if (!column || !host.video) {
         setStageSize({});
-        return;
+        return false;
       }
       const styles = window.getComputedStyle(column);
       const paddingX = Number.parseFloat(styles.paddingLeft) + Number.parseFloat(styles.paddingRight);
@@ -614,10 +617,9 @@ function WatchRoom() {
       const availableHeight = isFullscreen
         ? column.clientHeight
         : Math.min(column.clientHeight, window.innerHeight - columnTop - safeBottom);
-      const maxStageHeight = Math.max(
-        160,
-        availableHeight - paddingY - controlsHeight - reactionsHeight - mediaReserve - gap * (rowCount - 1),
-      );
+      const rawMaxStageHeight =
+        availableHeight - paddingY - controlsHeight - reactionsHeight - mediaReserve - gap * (rowCount - 1);
+      const maxStageHeight = Math.max(160, rawMaxStageHeight);
       const ratio = Number.isFinite(videoAspectRatio) && videoAspectRatio > 0 ? videoAspectRatio : 16 / 9;
       const width = Math.min(contentWidth, maxStageHeight * ratio);
       const height = width / ratio;
@@ -625,6 +627,7 @@ function WatchRoom() {
         width: Math.max(160, Math.floor(width)),
         height: Math.max(120, Math.floor(height)),
       });
+      return rawMaxStageHeight < 160 || contentWidth < 160 || width < 160 || height < 120;
     };
 
     // Any trigger's measurement can race a layout that has not settled yet
@@ -634,14 +637,44 @@ function WatchRoom() {
     // resolving). A too-small reading gets clamped to the 160x120 emergency
     // floor and then sticks, because a stage that small does not itself
     // change size, so the ResizeObserver watching it has nothing further to
-    // fire on. Every trigger below therefore schedules a same-frame retry
-    // after paint, not just the initial mount measurement.
+    // fire on.
+    //
+    // Two layers of retry: a same-frame rAF pair catches the common case
+    // (cheap, fires on every trigger), and if the layout is STILL unsettled
+    // after that, a backoff schedule keeps rechecking for up to ~1.5s - a
+    // real OS fullscreen transition can easily outlast a couple of frames.
     const rafIds: number[] = [];
+    const timeoutIds: number[] = [];
+    const BACKOFF_DELAYS_MS = [100, 250, 500, 900, 1500];
+
+    const scheduleBackoffRetries = () => {
+      timeoutIds.forEach((id) => window.clearTimeout(id));
+      timeoutIds.length = 0;
+      for (const delay of BACKOFF_DELAYS_MS) {
+        timeoutIds.push(
+          window.setTimeout(() => {
+            if (updateStageSize()) {
+              // Still unsettled: let the remaining scheduled attempts run.
+              return;
+            }
+            timeoutIds.forEach((id) => window.clearTimeout(id));
+            timeoutIds.length = 0;
+          }, delay),
+        );
+      }
+    };
+
     const updateStageSizeSafely = () => {
       updateStageSize();
       rafIds.push(
         requestAnimationFrame(() => {
-          rafIds.push(requestAnimationFrame(updateStageSize));
+          rafIds.push(
+            requestAnimationFrame(() => {
+              if (updateStageSize()) {
+                scheduleBackoffRetries();
+              }
+            }),
+          );
         }),
       );
     };
@@ -663,6 +696,7 @@ function WatchRoom() {
     document.addEventListener("webkitfullscreenchange", updateStageSizeSafely);
     return () => {
       rafIds.forEach((id) => cancelAnimationFrame(id));
+      timeoutIds.forEach((id) => window.clearTimeout(id));
       observer?.disconnect();
       window.removeEventListener("resize", updateStageSizeSafely);
       document.removeEventListener("fullscreenchange", updateStageSizeSafely);
